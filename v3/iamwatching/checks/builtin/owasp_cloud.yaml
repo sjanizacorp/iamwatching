@@ -1,0 +1,338 @@
+# OWASP Cloud-Native Application Security Top 10 (2024) — COMPLETE
+# Source: https://owasp.org/www-project-cloud-native-application-security-top-10/
+# All 10 risks mapped to property-based Cypher queries.
+# Relationship-based checks use OPTIONAL MATCH so they run even if graph edges
+# don't exist yet — they return empty gracefully rather than raising warnings.
+
+framework: OWASP-CLOUD-NATIVE-2024
+description: OWASP Cloud-Native Application Security Top 10 — all 10 risks
+
+checks:
+
+  - id: OWASP-CNAS-1
+    title: "Insecure Cloud / Container / Orchestrator Configuration"
+    severity: HIGH
+    description: >
+      OWASP CNAS-1: Misconfigured cloud services are the leading cause of
+      cloud-native breaches. This includes running containers as root, using
+      default configurations, and missing least-privilege IAM enforcement.
+      Detect principals with wildcard resource policies.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      OPTIONAL MATCH (p)-[e:HAS_PERMISSION]->(r:Resource)
+        WHERE (e.action = '*' OR e.action ENDS WITH ':*')
+          AND e.effect = 'Allow'
+      WITH p, collect(DISTINCT e.action) AS wildcard_actions,
+           count(DISTINCT r) AS resource_count
+      WHERE resource_count > 0
+      RETURN COALESCE(p.arn, p.object_id, p.email) AS principal,
+             labels(p) AS cloud,
+             wildcard_actions,
+             resource_count
+      ORDER BY resource_count DESC
+      LIMIT 50
+    recommendation: >
+      Replace wildcard actions with explicit action lists. Scope to specific
+      resource ARNs. Use IAM Access Analyzer to generate least-privilege policies.
+    mitre: ["T1078.004 - Cloud Accounts", "T1548 - Abuse Elevation Control Mechanism"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]
+
+  - id: OWASP-CNAS-1B
+    title: "Wildcard admin policies on IAM principals (property-based)"
+    severity: CRITICAL
+    description: >
+      Detects IAM principals with wildcard admin actions in their attached or
+      inline policies using stored JSON properties — works without HAS_PERMISSION edges.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WHERE p.inline_policies CONTAINS '"Action": "*"'
+         OR p.inline_policies CONTAINS '"Action":["*"]'
+         OR p.attached_policies CONTAINS 'AdministratorAccess'
+         OR p.inline_policies CONTAINS '"Action": "iam:*"'
+      RETURN p.arn AS principal_arn,
+             p.name AS name,
+             p.principal_type AS type,
+             'Wildcard or admin-level actions detected in principal policies' AS issue
+      ORDER BY p.principal_type, p.name
+    recommendation: >
+      Audit and replace AdministratorAccess and wildcard service actions with
+      least-privilege policies. Use IAM Access Analyzer to identify overpermission.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]
+
+  - id: OWASP-CNAS-2
+    title: "Broken Authentication — Overprivileged Service Identities"
+    severity: HIGH
+    description: >
+      OWASP CNAS-2: Service accounts, Lambda execution roles, and ECS task roles
+      with excessive permissions violate least privilege. A code execution flaw
+      immediately yields cloud account control if the role is overprivileged.
+    cypher: |
+      MATCH (role:AWSPrincipal {principal_type: 'Role'})
+      OPTIONAL MATCH (role)-[e:HAS_PERMISSION]->(r)
+        WHERE e.action IN ['iam:*', 'sts:*', '*', 's3:*', 'ec2:*', 'lambda:*']
+          AND e.effect = 'Allow'
+      WITH role, collect(DISTINCT e.action) AS dangerous_actions
+      WHERE size(dangerous_actions) >= 2
+      RETURN role.arn AS execution_role,
+             dangerous_actions,
+             'Execution role has service-wide permissions — potential lateral movement vector' AS issue
+      ORDER BY size(dangerous_actions) DESC
+      LIMIT 50
+    recommendation: >
+      Apply task-specific least-privilege roles to Lambda/ECS/EC2. Never
+      attach AdministratorAccess to compute execution roles.
+    mitre: ["T1078.004 - Cloud Accounts", "T1610 - Deploy Container"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]
+
+  - id: OWASP-CNAS-2B
+    title: "Broken Authentication — roles with admin-level policies (property-based)"
+    severity: HIGH
+    description: >
+      Execution roles with AdministratorAccess or inline wildcard policies,
+      detectable without graph relationships.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'Role'})
+      WHERE p.attached_policies CONTAINS 'AdministratorAccess'
+         OR p.inline_policies CONTAINS '"Action": "*"'
+         OR p.inline_policies CONTAINS '"Action": "iam:*"'
+      RETURN p.arn AS role_arn,
+             p.name AS role_name,
+             'Role has admin-level or wildcard policies — high risk execution role' AS issue
+      ORDER BY p.name
+    recommendation: >
+      Replace AdministratorAccess on execution roles with least-privilege policies.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]
+
+  - id: OWASP-CNAS-3
+    title: "Insecure Third-Party Dependencies — External Trust Relationships"
+    severity: HIGH
+    description: >
+      OWASP CNAS-3: Roles trusting external accounts, federated identity providers,
+      or wildcard principals without conditions create supply chain risk.
+    cypher: |
+      MATCH (src:AWSPrincipal {principal_type: 'Role'})
+      OPTIONAL MATCH (src)-[e:CAN_ASSUME]->(tgt:AWSPrincipal)
+        WHERE src.account_id <> tgt.account_id
+           OR e.condition CONTAINS '"AWS": "*"'
+           OR e.condition CONTAINS '"Federated"'
+      WITH src, tgt, e
+      WHERE tgt IS NOT NULL
+      RETURN src.arn AS trusting_role,
+             tgt.arn AS trusted_by,
+             e.condition AS trust_condition,
+             CASE
+               WHEN src.account_id <> tgt.account_id THEN 'Cross-account trust'
+               WHEN e.condition CONTAINS '"AWS": "*"' THEN 'Wildcard principal'
+               ELSE 'Federated trust'
+             END AS trust_type
+      LIMIT 50
+    recommendation: >
+      Add aws:PrincipalOrgID conditions to cross-account trust policies.
+      Add ExternalId for vendor integrations. Audit all federated trust quarterly.
+    mitre: ["T1199 - Trusted Relationship"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]
+
+  - id: OWASP-CNAS-3B
+    title: "External trust in role metadata (property-based)"
+    severity: HIGH
+    description: >
+      Roles with cross-account or wildcard trust policies, detectable from
+      the assume_role_policy stored in node metadata.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'Role'})
+      WHERE p.metadata CONTAINS '"Principal": "*"'
+         OR (p.metadata CONTAINS '"AWS":' AND p.metadata CONTAINS ':root"')
+      RETURN p.arn AS role_arn,
+             p.name AS role_name,
+             'Role trust policy may allow broad or cross-account access — review assume_role_policy in metadata' AS issue
+      LIMIT 50
+    recommendation: >
+      Review assume_role_policy in the IAM console. Add Condition blocks with
+      aws:PrincipalOrgID or ExternalId to all cross-account trust policies.
+    mitre: ["T1199 - Trusted Relationship"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]
+
+  - id: OWASP-CNAS-4
+    title: "Improper Asset and Permission Scope — Principals With No Policies"
+    severity: MEDIUM
+    description: >
+      OWASP CNAS-4: IAM principals with zero policies represent dormant identities
+      with no documented purpose. They should be reviewed and removed.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WHERE (p.attached_policy_count = 0 OR p.attached_policy_count IS NULL)
+        AND (p.inline_policy_count = 0 OR p.inline_policy_count IS NULL)
+        AND p.principal_type IN ['User', 'Role']
+      RETURN p.principal_type AS type,
+             p.arn AS principal,
+             p.name AS name,
+             'Principal has no attached or inline policies — review if still needed' AS issue
+      ORDER BY p.principal_type, p.name
+      LIMIT 50
+    recommendation: >
+      Review all zero-policy identities. Delete unused users and roles.
+      Implement quarterly access reviews.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]
+
+  - id: OWASP-CNAS-5
+    title: "Inadequate Logging and Monitoring"
+    severity: MEDIUM
+    description: >
+      OWASP CNAS-5: Without logging, attackers can operate undetected.
+      Resources missing tags cannot be monitored or attributed in incident response.
+    cypher: |
+      MATCH (r:Resource)
+      WHERE r.tags = '{}' OR r.tags IS NULL OR r.tags = ''
+      RETURN labels(r) AS cloud,
+             r.resource_type AS resource_type,
+             COALESCE(r.arn, r.resource_id) AS resource_id,
+             r.name AS name,
+             'Resource has no tags — monitoring and attribution impossible' AS issue
+      ORDER BY cloud, resource_type
+      LIMIT 100
+    recommendation: >
+      Enforce mandatory tagging (owner, team, environment) via AWS Organizations
+      Tag Policies or equivalent. Resources without owner tags cannot be
+      attributed during security incidents.
+    mitre: ["T1562 - Impair Defenses"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]
+
+  - id: OWASP-CNAS-6
+    title: "Secrets and Credentials in Compute Environment Variables"
+    severity: CRITICAL
+    description: >
+      OWASP CNAS-6: Hardcoded API keys, secrets, and credentials in Lambda
+      environment variables, ECS task definitions, or EC2 user data are exposed
+      to anyone with read access. This has caused major cloud breaches.
+    cypher: |
+      MATCH (r:Resource)
+      WHERE r.has_env_vars = true
+      OPTIONAL MATCH (r)-[e:CROSS_CLOUD_LINK]->(tgt)
+      WITH r, collect(DISTINCT e) AS credential_links, count(DISTINCT tgt) AS cred_count
+      WHERE r.has_env_vars = true
+      RETURN labels(r) AS resource_cloud,
+             COALESCE(r.arn, r.resource_id) AS resource,
+             r.resource_type AS resource_type,
+             cred_count AS discovered_credentials,
+             'Resource has environment variables — check for hardcoded secrets' AS issue
+      ORDER BY cred_count DESC
+      LIMIT 100
+    recommendation: >
+      Migrate all secrets to AWS Secrets Manager, Azure Key Vault, or
+      GCP Secret Manager. Use execution roles for service-to-service auth.
+    mitre: ["T1552.001 - Credentials In Files", "T1552.005 - Cloud Instance Metadata API"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]
+
+  - id: OWASP-CNAS-6B
+    title: "Verified cross-cloud credential leakage"
+    severity: CRITICAL
+    description: >
+      Credentials from one cloud found embedded in another cloud's compute
+      resources, with at least one confirmed as still-valid (live credential).
+    cypher: |
+      MATCH (r:Resource)
+      OPTIONAL MATCH (r)-[e:CROSS_CLOUD_LINK]->(tgt)
+        WHERE e.verified = true
+      WITH r, collect(e) AS live_links, count(e) AS live_count
+      WHERE live_count > 0
+      RETURN COALESCE(r.arn, r.resource_id) AS resource,
+             r.resource_type AS type,
+             live_count AS live_credentials,
+             'VERIFIED LIVE: credential from another cloud found and confirmed active' AS issue
+      ORDER BY live_count DESC
+    recommendation: >
+      IMMEDIATE ACTION: Rotate the leaked credentials immediately.
+      Remove from compute environment. Move to a secrets manager.
+      Investigate for unauthorized usage in CloudTrail/audit logs.
+    mitre: ["T1552.001 - Credentials In Files", "T1078 - Valid Accounts"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]
+
+  - id: OWASP-CNAS-7
+    title: "Insecure Network Controls — Public Resources"
+    severity: HIGH
+    description: >
+      OWASP CNAS-7: Resources with public resource policies or security groups
+      open to the internet represent excessive network exposure.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 's3:Bucket'})
+      WHERE r.resource_policy CONTAINS '"Principal": "*"'
+         OR r.resource_policy CONTAINS '"Principal":"*"'
+      RETURN r.arn AS bucket_arn,
+             r.name AS bucket_name,
+             r.region AS region,
+             'S3 bucket has a public resource policy — data accessible to anyone' AS issue
+      ORDER BY r.name
+    recommendation: >
+      Enable S3 Block Public Access at account level. Remove public bucket policies.
+      Use CloudFront with Origin Access Control for public content delivery.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]
+
+  - id: OWASP-CNAS-8
+    title: "Container Escape via Overprivileged Task/Pod Identity"
+    severity: HIGH
+    description: >
+      OWASP CNAS-8: ECS task definitions or Lambda functions with hardcoded
+      credentials or excessive IAM permissions mean a container escape
+      immediately yields cloud account access.
+    cypher: |
+      MATCH (r:AWSResource)
+      WHERE r.resource_type IN ['ecs:TaskDefinition', 'lambda:Function']
+        AND r.has_env_vars = true
+      RETURN r.arn AS resource_arn,
+             r.name AS name,
+             r.resource_type AS type,
+             r.region AS region,
+             'Compute resource has environment variables — scan for embedded credentials' AS issue
+      ORDER BY r.resource_type, r.name
+      LIMIT 50
+    recommendation: >
+      Assign minimal IAM task/execution roles. Remove all credentials from
+      environment variables. Use Secrets Manager with IAM role access.
+    mitre: ["T1610 - Deploy Container", "T1552.001 - Credentials In Files"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]
+
+  - id: OWASP-CNAS-9
+    title: "Using Components With Known Vulnerabilities"
+    severity: MEDIUM
+    description: >
+      OWASP CNAS-9: EC2 instances and ECS tasks should run the latest patched
+      AMIs and container images. Outdated base images expose known CVEs.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'ec2:Instance'})
+      RETURN r.arn AS instance_arn,
+             r.name AS name,
+             r.region AS region,
+             r.metadata AS metadata,
+             'Verify instance uses a patched, current AMI — check AWS Inspector for vulnerability findings' AS action
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Enable AWS Inspector for EC2 vulnerability scanning. Automate AMI
+      rotation using EC2 Image Builder. Use Amazon ECR enhanced scanning
+      for container images.
+    mitre: ["T1190 - Exploit Public-Facing Application"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]
+
+  - id: OWASP-CNAS-10
+    title: "Insufficient Compute Resource Quotas and Rate Limiting"
+    severity: LOW
+    description: >
+      OWASP CNAS-10: Without resource quotas, a single compromised or
+      misbehaving workload can consume all account limits (Lambda concurrency,
+      EC2 vCPUs), causing denial of service for other systems.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'lambda:Function'})
+      RETURN count(r) AS total_functions,
+             collect(r.region)[0..5] AS sampled_regions,
+             'Review Lambda concurrency limits and reserved concurrency per function' AS action
+      LIMIT 1
+    recommendation: >
+      Set reserved concurrency limits on critical Lambda functions.
+      Monitor AWS Service Quotas for approaching limits. Set CloudWatch
+      alarms on resource quota utilisation.
+    mitre: ["T1499 - Endpoint Denial of Service"]
+    references: ["https://owasp.org/www-project-cloud-native-application-security-top-10/"]

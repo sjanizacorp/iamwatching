@@ -1,0 +1,2 @@
+[console_scripts]
+iamwatching = iamwatching.cli.main:main
