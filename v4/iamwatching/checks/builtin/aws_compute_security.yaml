@@ -1,0 +1,626 @@
+# AWS Application Plane — Compute, API, Messaging, Edge Security Checks
+# IamWatching v2.0 | Aniza Corp
+# All checks use properties stored on AWSResource nodes:
+#   r.encrypted, r.public_access, r.logging_enabled, r.backup_enabled,
+#   r.auth_type, r.tls_policy, r.vpc_id, r.metadata (JSON), r.tags
+
+framework: AWS-COMPUTE-SECURITY
+description: >
+  Security checks for AWS application plane services:
+  EC2, Lambda, ECS, EKS, Fargate, API Gateway, SQS, SNS, CloudFront.
+
+checks:
+
+  # ── EKS / Kubernetes ──────────────────────────────────────────────────────
+
+  - id: AWS-EKS-001
+    title: "EKS cluster endpoint should not be publicly accessible"
+    severity: CRITICAL
+    description: >
+      An EKS API server endpoint exposed to the internet can be targeted by
+      credential brute-force and vulnerability exploitation. The control plane
+      endpoint should be private or restricted to specific CIDR ranges.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'eks:Cluster'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+        AND (r.metadata IS NULL OR NOT r.metadata CONTAINS '"public_cidrs": []')
+      RETURN r.arn AS cluster_arn,
+             r.name AS cluster_name,
+             r.region AS region,
+             r.account_id AS account_id,
+             'EKS API endpoint is publicly accessible — restrict or disable public endpoint' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Set endpointPublicAccess=false and endpointPrivateAccess=true, or restrict
+      publicAccessCidrs to your organisation CIDR only. Use VPN/Direct Connect
+      for kubectl access.
+    mitre: ["T1133 - External Remote Services", "T1190 - Exploit Public-Facing Application"]
+    references: ["https://docs.aws.amazon.com/eks/latest/userguide/cluster-endpoint.html"]
+
+  - id: AWS-EKS-002
+    title: "EKS cluster control plane logging should be enabled"
+    severity: HIGH
+    description: >
+      EKS control plane logging captures API server, audit, authenticator,
+      controller manager, and scheduler events. Without it, attacker activity
+      within the Kubernetes control plane leaves no trace.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'eks:Cluster'})
+      WHERE r.logging_enabled = false OR r.logging_enabled IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS cluster_arn,
+             r.name AS cluster_name,
+             r.region AS region,
+             'EKS control plane logging is disabled — enable all log types' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable all five control plane log types: api, audit, authenticator,
+      controllerManager, scheduler. Route to CloudWatch Logs and set retention.
+    mitre: ["T1562.008 - Disable or Modify Cloud Logs"]
+    references: ["https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html"]
+
+  - id: AWS-EKS-003
+    title: "EKS cluster should have envelope encryption for secrets"
+    severity: HIGH
+    description: >
+      Without envelope encryption, Kubernetes secrets stored in etcd are only
+      base64-encoded. KMS encryption provides a second layer of protection for
+      sensitive secrets if etcd storage is compromised.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'eks:Cluster'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS cluster_arn,
+             r.name AS cluster_name,
+             r.region AS region,
+             'EKS secrets not encrypted with KMS — enable envelope encryption' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable envelope encryption with a KMS key when creating or updating
+      the cluster. This cannot be disabled once enabled.
+    mitre: ["T1552.001 - Credentials In Files"]
+    references: ["https://docs.aws.amazon.com/eks/latest/userguide/enable-kms.html"]
+
+  - id: AWS-EKS-004
+    title: "EKS clusters should use IAM Roles for Service Accounts (IRSA)"
+    severity: MEDIUM
+    description: >
+      Without IRSA, pods running in EKS inherit the node IAM role, giving all
+      pods on a node the same AWS permissions — a serious lateral movement risk
+      if any pod is compromised.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'eks:Cluster'})
+      WHERE NOT r.metadata CONTAINS 'oidc'
+        AND r.scan_start_ms >= $scan_start
+         OR r.auth_type = ''
+      RETURN r.arn AS cluster_arn,
+             r.name AS cluster_name,
+             r.region AS region,
+             'Verify IRSA/OIDC is configured for pod-level IAM permissions' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Configure the OIDC provider for the cluster and use IRSA to assign
+      per-service-account IAM roles. Remove broad permissions from node instance profiles.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html"]
+
+  # ── API Gateway ───────────────────────────────────────────────────────────
+
+  - id: AWS-APIGW-001
+    title: "API Gateway REST API should have logging enabled"
+    severity: HIGH
+    description: >
+      Without execution logging, API Gateway provides no visibility into
+      request patterns, error rates, or potential abuse. Access logging is
+      required for PCI DSS, HIPAA, and most compliance frameworks.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'apigateway:RestApi'})
+      WHERE r.logging_enabled = false OR r.logging_enabled IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS api_arn,
+             r.name AS api_name,
+             r.region AS region,
+             r.account_id AS account_id,
+             'API Gateway REST API has no execution logging — enable CloudWatch logging' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable CloudWatch logging on each API stage. Set logLevel=INFO at minimum,
+      ERROR for production. Enable access logging with a structured format.
+    mitre: ["T1562.008 - Disable or Modify Cloud Logs"]
+    references: ["https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-logging.html"]
+
+  - id: AWS-APIGW-002
+    title: "API Gateway should have a WAF WebACL attached"
+    severity: HIGH
+    description: >
+      API Gateway endpoints without WAF protection are vulnerable to SQL injection,
+      XSS, rate-limit bypass, and OWASP Top 10 attacks. WAF provides a managed
+      rule layer without requiring application code changes.
+    cypher: |
+      MATCH (r:AWSResource)
+      WHERE r.resource_type IN ['apigateway:RestApi', 'apigateway:HttpApi']
+        AND r.scan_start_ms >= $scan_start
+        AND (r.metadata IS NULL OR NOT r.metadata CONTAINS '"waf')
+      RETURN r.arn AS api_arn,
+             r.name AS api_name,
+             r.resource_type AS api_type,
+             r.region AS region,
+             'API Gateway has no WAF WebACL — attach AWS Managed Rules at minimum' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Attach an AWS WAF WebACL with AWSManagedRulesCommonRuleSet to every
+      API Gateway stage. Add rate-based rules appropriate to your traffic patterns.
+    mitre: ["T1190 - Exploit Public-Facing Application"]
+    references: ["https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-control-access-aws-waf.html"]
+
+  - id: AWS-APIGW-003
+    title: "API Gateway should use private endpoint or resource policy"
+    severity: MEDIUM
+    description: >
+      Public API endpoints with no resource policy restriction are accessible
+      from the entire internet. Internal APIs should use VPC endpoints or
+      resource policies restricting access to known principals or VPCs.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'apigateway:RestApi'})
+      WHERE NOT r.metadata CONTAINS '"policy": true'
+        AND r.scan_start_ms >= $scan_start
+        AND NOT r.vpc_id <> ''
+      RETURN r.arn AS api_arn,
+             r.name AS api_name,
+             r.region AS region,
+             'REST API has no resource policy and is not VPC-private — review exposure' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      For internal APIs, use PRIVATE endpoint type with VPC endpoint.
+      For external APIs, add resource policy restricting access to known IPs or principals.
+    mitre: ["T1190 - Exploit Public-Facing Application"]
+    references: ["https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-resource-policies.html"]
+
+  - id: AWS-APIGW-004
+    title: "API Gateway stages should use TLS 1.2 minimum"
+    severity: MEDIUM
+    description: >
+      Older TLS versions (1.0, 1.1) have known vulnerabilities including POODLE,
+      BEAST, and CRIME. API Gateway should enforce TLS 1.2 as the minimum
+      acceptable protocol.
+    cypher: |
+      MATCH (r:AWSResource)
+      WHERE r.resource_type IN ['apigateway:RestApi', 'apigateway:HttpApi']
+        AND r.scan_start_ms >= $scan_start
+        AND r.tls_policy IN ['TLS_1_0', 'TLS_1_1', '']
+        AND r.tls_policy IS NOT NULL
+      RETURN r.arn AS api_arn,
+             r.name AS api_name,
+             r.tls_policy AS current_tls,
+             r.region AS region,
+             'API Gateway using deprecated TLS version — enforce TLS 1.2 minimum' AS issue
+    recommendation: >
+      Set securityPolicy to TLS_1_2 on all custom domain names.
+      For regional APIs, verify the CloudFront distribution uses TLSv1.2_2021 policy.
+    mitre: ["T1557 - Adversary-in-the-Middle"]
+    references: ["https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-custom-domain-tls-version.html"]
+
+  # ── SQS ───────────────────────────────────────────────────────────────────
+
+  - id: AWS-SQS-001
+    title: "SQS queues should be encrypted with KMS"
+    severity: MEDIUM
+    description: >
+      SQS queues without KMS encryption store messages at rest using SSE-SQS
+      (AWS-managed keys). For sensitive data, customer-managed KMS keys provide
+      key usage auditing and independent access control.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'sqs:Queue'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS queue_arn,
+             r.name AS queue_name,
+             r.region AS region,
+             r.account_id AS account_id,
+             'SQS queue not encrypted with KMS — enable SSE with customer-managed key' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Set KmsMasterKeyId to a customer-managed KMS key on all queues
+      handling sensitive data. Use key policies to control which principals
+      can encrypt/decrypt.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-server-side-encryption.html"]
+
+  - id: AWS-SQS-002
+    title: "SQS queue should not have a public access policy"
+    severity: CRITICAL
+    description: >
+      An SQS queue with a resource policy allowing Principal=* means any AWS
+      account can send messages to it. This can lead to message injection,
+      queue flooding, and in some cases denial of service for consumers.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'sqs:Queue'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS queue_arn,
+             r.name AS queue_name,
+             r.region AS region,
+             'SQS queue is publicly accessible — remove wildcard principal from policy' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Remove Principal=* from SQS queue policies. Restrict to specific
+      AWS account IDs or IAM principals. Use VPC endpoints for internal access.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-security-best-practices.html"]
+
+  - id: AWS-SQS-003
+    title: "SQS queues should have a dead-letter queue configured"
+    severity: LOW
+    description: >
+      Without a DLQ, failed message processing leads to silent message loss
+      or infinite retry loops consuming compute resources. DLQs enable
+      investigation of poison messages and prevent queue flooding.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'sqs:Queue'})
+      WHERE NOT r.metadata CONTAINS '"dlq": true'
+        AND r.scan_start_ms >= $scan_start
+        AND NOT r.name ENDS WITH '-dlq'
+        AND NOT r.name ENDS WITH '-dead-letter'
+      RETURN r.arn AS queue_arn,
+             r.name AS queue_name,
+             r.region AS region,
+             'Queue has no dead-letter queue — configure DLQ for resilient message processing' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Configure a RedrivePolicy pointing to a separate DLQ. Set maxReceiveCount
+      to 3-5 retries before moving to DLQ. Set CloudWatch alarm on DLQ depth.
+    mitre: []
+    references: ["https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html"]
+
+  # ── SNS ───────────────────────────────────────────────────────────────────
+
+  - id: AWS-SNS-001
+    title: "SNS topics should be encrypted with KMS"
+    severity: MEDIUM
+    description: >
+      SNS topics without KMS encryption store messages in plaintext at rest.
+      Topics handling PII, financial data, or security events should use
+      customer-managed KMS keys for encryption and audit trail.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'sns:Topic'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS topic_arn,
+             r.name AS topic_name,
+             r.region AS region,
+             r.account_id AS account_id,
+             'SNS topic not encrypted with KMS — enable server-side encryption' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Set KmsMasterKeyId to a customer-managed KMS key. Grant kms:GenerateDataKey
+      and kms:Decrypt to SNS in the key policy.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://docs.aws.amazon.com/sns/latest/dg/sns-server-side-encryption.html"]
+
+  - id: AWS-SNS-002
+    title: "SNS topic should not allow public subscriptions"
+    severity: HIGH
+    description: >
+      SNS topics with policies allowing Principal=* can be subscribed to by
+      any AWS account, potentially exposing all published messages to
+      unintended external parties.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'sns:Topic'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS topic_arn,
+             r.name AS topic_name,
+             r.region AS region,
+             'SNS topic allows public access — restrict policy to known principals' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Remove Principal=* from SNS topic policies. Restrict to specific
+      AWS account IDs and enforce aws:SourceAccount or aws:SourceArn conditions.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://docs.aws.amazon.com/sns/latest/dg/sns-access-policy-use-cases.html"]
+
+  # ── CloudFront ────────────────────────────────────────────────────────────
+
+  - id: AWS-CF-001
+    title: "CloudFront distribution should redirect HTTP to HTTPS"
+    severity: HIGH
+    description: >
+      CloudFront distributions that allow HTTP traffic expose users to
+      man-in-the-middle attacks and session hijacking. All viewer connections
+      should be forced to HTTPS.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'cloudfront:Distribution'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS distribution_arn,
+             r.name AS domain_name,
+             'CloudFront distribution allows HTTP — set ViewerProtocolPolicy to redirect-to-https' AS issue
+      ORDER BY r.name
+    recommendation: >
+      Set ViewerProtocolPolicy to redirect-to-https or https-only on the
+      default cache behavior and all cache behaviors. Never use allow-all.
+    mitre: ["T1557 - Adversary-in-the-Middle"]
+    references: ["https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-https.html"]
+
+  - id: AWS-CF-002
+    title: "CloudFront distribution should use TLS 1.2 or higher"
+    severity: HIGH
+    description: >
+      CloudFront distributions configured with TLS 1.0 or 1.1 are vulnerable
+      to POODLE, BEAST, and other protocol-level attacks. Modern standards
+      require TLS 1.2 minimum.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'cloudfront:Distribution'})
+      WHERE r.tls_policy IN ['TLSv1', 'TLSv1_2016', 'TLSv1.1_2016', '']
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS distribution_arn,
+             r.name AS domain_name,
+             r.tls_policy AS current_tls,
+             'CloudFront using deprecated TLS — upgrade to TLSv1.2_2021 or TLSv1.2_2019' AS issue
+      ORDER BY r.name
+    recommendation: >
+      Set MinimumProtocolVersion to TLSv1.2_2021 on all distributions.
+      This drops support for IE11 on Windows XP but is required for PCI DSS 4.0.
+    mitre: ["T1557 - Adversary-in-the-Middle"]
+    references: ["https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/secure-connections-supported-viewer-protocols-ciphers.html"]
+
+  - id: AWS-CF-003
+    title: "CloudFront distribution should have WAF enabled"
+    severity: HIGH
+    description: >
+      CloudFront distributions without WAF protection are exposed to SQL injection,
+      XSS, bad bots, and OWASP Top 10 attacks at the edge. WAF at CloudFront
+      blocks attacks before they reach the origin.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'cloudfront:Distribution'})
+      WHERE NOT r.metadata CONTAINS '"waf_enabled": true'
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS distribution_arn,
+             r.name AS domain_name,
+             'CloudFront distribution has no WAF WebACL attached' AS issue
+      ORDER BY r.name
+    recommendation: >
+      Associate an AWS WAF WebACL (WAFv2) with the distribution.
+      Enable AWSManagedRulesCommonRuleSet and AWSManagedRulesBotControlRuleSet.
+    mitre: ["T1190 - Exploit Public-Facing Application"]
+    references: ["https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/distribution-web-awswaf.html"]
+
+  - id: AWS-CF-004
+    title: "CloudFront distribution should have access logging enabled"
+    severity: MEDIUM
+    description: >
+      CloudFront access logs capture every viewer request including IP, URI,
+      status, user agent, and referrer. Without them, security investigations
+      and compliance reporting are impossible.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'cloudfront:Distribution'})
+      WHERE NOT r.metadata CONTAINS '"logging": true'
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS distribution_arn,
+             r.name AS domain_name,
+             'CloudFront distribution has no access logging — enable to S3 bucket' AS issue
+      ORDER BY r.name
+    recommendation: >
+      Enable access logging to a dedicated S3 bucket. Prefix logs by distribution
+      ID. Set S3 lifecycle to retain logs for 90+ days and archive to Glacier.
+    mitre: ["T1562.008 - Disable or Modify Cloud Logs"]
+    references: ["https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/AccessLogs.html"]
+
+  - id: AWS-CF-005
+    title: "CloudFront origins should not use HTTP-only protocol"
+    severity: HIGH
+    description: >
+      If CloudFront communicates with its origin over HTTP only, traffic between
+      the CDN and the origin server is unencrypted and vulnerable to interception,
+      even if viewer-to-CloudFront is HTTPS.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'cloudfront:Distribution'})
+      WHERE r.metadata CONTAINS '"http_only_origin": true'
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS distribution_arn,
+             r.name AS domain_name,
+             'CloudFront origin uses HTTP-only protocol — switch to HTTPS-only or match-viewer' AS issue
+      ORDER BY r.name
+    recommendation: >
+      Set OriginProtocolPolicy to https-only or match-viewer on all custom origins.
+      Ensure origin has a valid TLS certificate.
+    mitre: ["T1557 - Adversary-in-the-Middle"]
+    references: ["https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-https-cloudfront-to-custom-origin.html"]
+
+  # ── Lambda ────────────────────────────────────────────────────────────────
+
+  - id: AWS-LAMBDA-001
+    title: "Lambda functions should not have admin or wildcard IAM permissions"
+    severity: CRITICAL
+    description: >
+      Lambda execution roles with AdministratorAccess or wildcard IAM actions
+      mean that any code execution flaw (RCE, SSRF, code injection) immediately
+      yields full AWS account control.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'lambda:Function'})
+      OPTIONAL MATCH (role:AWSPrincipal {principal_type: 'Role'})-[:DEPLOYED_WITH_ROLE]->(r)
+      WHERE role IS NOT NULL AND (
+        AND role.scan_start_ms >= $scan_start
+        role.attached_policies CONTAINS 'AdministratorAccess'
+        OR role.inline_policies CONTAINS '"Action": "*"'
+      )
+      RETURN r.arn AS function_arn,
+             r.name AS function_name,
+             r.region AS region,
+             role.arn AS execution_role,
+             'Lambda execution role has admin permissions — apply least privilege' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Grant Lambda execution roles only the specific actions and resources
+      they need. Use resource-based conditions to scope to specific ARNs.
+    mitre: ["T1078.004 - Cloud Accounts", "T1610 - Deploy Container"]
+    references: ["https://docs.aws.amazon.com/lambda/latest/dg/lambda-permissions.html"]
+
+  - id: AWS-LAMBDA-002
+    title: "Lambda functions should be deployed inside a VPC"
+    severity: LOW
+    description: >
+      Lambda functions outside a VPC can access the internet and internal
+      AWS services without network-level controls. VPC deployment enables
+      security groups, NACLs, and VPC flow logs for traffic inspection.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'lambda:Function'})
+      WHERE r.vpc_id = '' OR r.vpc_id IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS function_arn,
+             r.name AS function_name,
+             r.region AS region,
+             'Lambda function not in a VPC — consider VPC deployment for network isolation' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Deploy Lambda functions into a private VPC subnet. Use VPC endpoints
+      for AWS service access. Only expose functions that require internet access.
+    mitre: []
+    references: ["https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html"]
+
+  - id: AWS-LAMBDA-003
+    title: "Lambda functions with env vars should use KMS encryption"
+    severity: MEDIUM
+    description: >
+      Lambda environment variables are encrypted at rest using AWS-managed keys
+      by default. Functions storing secrets, tokens, or connection strings in
+      env vars should use a customer-managed KMS key for additional protection
+      and independent key usage auditing.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'lambda:Function'})
+      WHERE r.has_env_vars = true
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS function_arn,
+             r.name AS function_name,
+             r.region AS region,
+             'Lambda has env vars — verify KMS customer key is used; prefer Secrets Manager' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 100
+    recommendation: >
+      Replace environment variable secrets with AWS Secrets Manager references.
+      If env vars are required, specify a KMS key in the function configuration.
+    mitre: ["T1552.001 - Credentials In Files"]
+    references: ["https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars-encryption.html"]
+
+  # ── EC2 ───────────────────────────────────────────────────────────────────
+
+  - id: AWS-EC2-001
+    title: "EC2 instances should use IMDSv2 (instance metadata token required)"
+    severity: HIGH
+    description: >
+      IMDSv1 allows any process with network access to query instance metadata
+      (including credentials) with a single HTTP GET. IMDSv2 requires a session
+      token obtained via PUT, which blocks SSRF attacks from reaching the IMDS.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'ec2:Instance'})
+      WHERE NOT r.metadata CONTAINS '"imdsv2": true'
+        AND r.scan_start_ms >= $scan_start
+         OR NOT r.metadata CONTAINS 'HttpTokens'
+      RETURN r.arn AS instance_arn,
+             r.name AS instance_name,
+             r.region AS region,
+             r.account_id AS account_id,
+             'EC2 instance may not enforce IMDSv2 — check HttpTokens=required' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 100
+    recommendation: >
+      Set HttpTokens=required on all instances. Enforce via AWS Config rule
+      ec2-imdsv2-check. Set account-level IMDS default to required via
+      EC2 Account Attributes.
+    mitre: ["T1552.005 - Cloud Instance Metadata API"]
+    references: ["https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html"]
+
+  - id: AWS-EC2-002
+    title: "EC2 instances should not have public IPs assigned"
+    severity: MEDIUM
+    description: >
+      EC2 instances with public IP addresses are directly reachable from the
+      internet. All internet-facing access should go through load balancers
+      or NAT gateways; instances themselves should be in private subnets.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'ec2:Instance'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS instance_arn,
+             r.name AS instance_name,
+             r.region AS region,
+             'EC2 instance has public IP — move to private subnet or use load balancer' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 100
+    recommendation: >
+      Disable auto-assign public IP on subnets. Move instances to private
+      subnets. Use ALB/NLB for inbound traffic and NAT Gateway for outbound.
+    mitre: ["T1133 - External Remote Services"]
+    references: ["https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-instance-addressing.html"]
+
+  # ── ECS / Fargate ─────────────────────────────────────────────────────────
+
+  - id: AWS-ECS-001
+    title: "ECS task definitions should not use host network mode"
+    severity: HIGH
+    description: >
+      ECS tasks running in host network mode share the host's network namespace,
+      allowing containers to reach services listening on the host and bypass
+      container network isolation. This is especially dangerous in multi-tenant
+      environments.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'ecs:TaskDefinition'})
+      WHERE r.metadata CONTAINS '"networkMode": "host"'
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS task_def_arn,
+             r.name AS task_name,
+             r.region AS region,
+             'ECS task uses host network mode — switch to awsvpc for network isolation' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Change networkMode to awsvpc (Fargate) or bridge. Use awsvpc for
+      Fargate tasks and when precise network control is needed for EC2 launch type.
+    mitre: ["T1610 - Deploy Container"]
+    references: ["https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html"]
+
+  - id: AWS-ECS-002
+    title: "ECS task definitions should not run as privileged"
+    severity: CRITICAL
+    description: >
+      Privileged ECS containers run with all Linux capabilities and full access
+      to the host device namespace. A container escape in privileged mode gives
+      the attacker complete control of the underlying host.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'ecs:TaskDefinition'})
+      WHERE r.metadata CONTAINS '"privileged": true'
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS task_def_arn,
+             r.name AS task_name,
+             r.region AS region,
+             'ECS task has privileged=true — remove and use fine-grained Linux capabilities' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Remove privileged=true. Drop all capabilities by default (cap_drop: ALL)
+      and only add back specifically required capabilities (e.g. NET_BIND_SERVICE).
+    mitre: ["T1611 - Escape to Host"]
+    references: ["https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html"]
+
+  - id: AWS-ECS-003
+    title: "ECS task definitions should have logging configured"
+    severity: MEDIUM
+    description: >
+      ECS tasks without a logConfiguration send stdout/stderr to nowhere,
+      making debugging, security investigation, and compliance reporting
+      impossible after the task exits.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'ecs:TaskDefinition'})
+      WHERE r.logging_enabled = false OR r.logging_enabled IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS task_def_arn,
+             r.name AS task_name,
+             r.region AS region,
+             'ECS task has no log configuration — add awslogs driver pointing to CloudWatch' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Configure logConfiguration with awslogs driver pointing to a CloudWatch
+      log group. Set log retention to 90+ days. Enable Container Insights.
+    mitre: ["T1562.008 - Disable or Modify Cloud Logs"]
+    references: ["https://docs.aws.amazon.com/AmazonECS/latest/developerguide/using_awslogs.html"]

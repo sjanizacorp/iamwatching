@@ -1,0 +1,51 @@
+# Custom Check Template — copy and modify for your own checks
+# Place custom YAML files in checks/custom/ directory
+# Run: iamwatching checks reload   to pick up new files without restart
+
+framework: CUSTOM
+description: Example custom checks — replace with your organization-specific rules
+
+checks:
+
+  - id: CUSTOM-001
+    title: "Example: Production resources must have specific tags"
+    severity: MEDIUM
+    description: >
+      Organization policy requires all production resources to have 'env=prod'
+      and 'owner=<team>' tags. Resources missing these tags cannot be attributed
+      during incidents.
+    cypher: |
+      MATCH (r:Resource)
+      WHERE NOT r.tags CONTAINS '"env"'
+         OR NOT r.tags CONTAINS '"owner"'
+      RETURN labels(r) AS cloud,
+             COALESCE(r.arn, r.resource_id) AS resource_id,
+             r.name AS name,
+             r.tags AS current_tags,
+             'Missing required org tags: env, owner' AS issue
+      LIMIT 100
+    recommendation: >
+      Apply mandatory tags via infrastructure-as-code. Enforce via AWS Organizations
+      SCP tag policies or equivalent.
+    mitre: []
+    references: []
+
+  - id: CUSTOM-002
+    title: "Example: Service accounts must follow naming convention"
+    severity: LOW
+    description: >
+      All service account identities must follow the naming pattern 'svc-*'
+      to distinguish them from human users in audit logs.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE NOT p.name STARTS WITH 'svc-'
+        AND (p.metadata CONTAINS 'access_key' OR p.attached_policy_count > 0)
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             'Service account does not follow svc-* naming convention' AS issue
+      LIMIT 50
+    recommendation: >
+      Rename service accounts to follow 'svc-<service>-<env>' convention.
+      Use SCPs to enforce naming on new accounts.
+    mitre: []
+    references: []

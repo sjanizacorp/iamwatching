@@ -1,0 +1,233 @@
+# Cross-Cloud Normalization Checks
+# IamWatching v2.0 | Aniza Corp
+# These checks apply the same security requirement across all three clouds,
+# using the normalised properties stored on all resource node types.
+
+framework: CROSS-CLOUD
+description: >
+  Architecture-agnostic checks that apply the same security control
+  across AWS, Azure, and GCP. Tests encryption, public access, logging,
+  authentication, and tagging regardless of cloud vendor.
+
+checks:
+
+  - id: XCLOUD-ENC-001
+    title: "All compute resources should have encryption at rest enabled"
+    severity: HIGH
+    description: >
+      Across all clouds, compute services (VMs, containers, functions) and
+      their attached storage should use encryption at rest. Unencrypted resources
+      expose data if physical media is accessed or snapshots are shared.
+    cypher: |
+      MATCH (r:Resource)
+      WHERE r.scan_start_ms >= $scan_start
+              AND r.resource_type IN [
+        'ec2:Instance', 'ecs:TaskDefinition', 'eks:Cluster',
+        'Microsoft.Compute/virtualMachines', 'Microsoft.ContainerService/managedClusters',
+        'container:Cluster', 'run:Service', 'cloudfunctions:Function'
+      ]
+      AND (r.encrypted = false OR r.encrypted IS NULL)
+      RETURN labels(r) AS cloud,
+             r.resource_type AS resource_type,
+             COALESCE(r.arn, r.resource_id) AS resource_id,
+             r.name AS name,
+             r.region AS region,
+             'Compute resource not encrypted at rest — enable disk/storage encryption' AS issue
+      ORDER BY cloud, resource_type, name
+      LIMIT 100
+    recommendation: >
+      AWS: Enable EBS encryption by default. Use KMS CMKs.
+      Azure: Enable Azure Disk Encryption or SSE with CMK.
+      GCP: Enable CMEK in Cloud KMS for all disks.
+    mitre: ["T1005 - Data from Local System"]
+    references:
+      - "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EBSEncryption.html"
+      - "https://docs.microsoft.com/en-us/azure/virtual-machines/disk-encryption-overview"
+      - "https://cloud.google.com/compute/docs/disks/customer-managed-encryption"
+
+  - id: XCLOUD-ENC-002
+    title: "All data storage resources should have encryption at rest enabled"
+    severity: HIGH
+    description: >
+      Databases, object stores, queues, and streams should all use encryption
+      at rest. Unencrypted data stores are a compliance violation for GDPR,
+      HIPAA, PCI DSS, and SOC 2.
+    cypher: |
+      MATCH (r:Resource)
+      WHERE r.scan_start_ms >= $scan_start
+              AND r.resource_type IN [
+        's3:Bucket', 'rds:DBInstance', 'dynamodb:Table',
+        'redshift:Cluster', 'elasticache:Cluster', 'kinesis:Stream',
+        'sqs:Queue', 'sns:Topic',
+        'Microsoft.Storage/storageAccounts', 'Microsoft.Sql/servers/databases',
+        'Microsoft.DocumentDB/databaseAccounts', 'Microsoft.ServiceBus/namespaces',
+        'storage:Bucket', 'sqladmin:Instance', 'bigquery:Dataset', 'pubsub:Topic'
+      ]
+      AND (r.encrypted = false OR r.encrypted IS NULL)
+      RETURN labels(r) AS cloud,
+             r.resource_type AS resource_type,
+             COALESCE(r.arn, r.resource_id) AS resource_id,
+             r.name AS name,
+             r.region AS region,
+             'Data resource not encrypted at rest — enable encryption with CMK' AS issue
+      ORDER BY cloud, resource_type, name
+      LIMIT 100
+    recommendation: >
+      Enable encryption at rest with customer-managed keys on all data services.
+      Ensure key rotation is configured. Store keys in dedicated KMS/Key Vault/Cloud KMS.
+    mitre: ["T1005 - Data from Local System", "T1530 - Data from Cloud Storage"]
+    references: []
+
+  - id: XCLOUD-PUB-001
+    title: "No resources should have public network access enabled"
+    severity: CRITICAL
+    description: >
+      Any resource with public_access=true is reachable from the internet without
+      network-level controls. Databases, queues, caches, and internal compute
+      should never be publicly accessible.
+    cypher: |
+      MATCH (r:Resource)
+      WHERE r.scan_start_ms >= $scan_start
+              AND r.public_access = true
+        AND NOT r.resource_type IN [
+          'cloudfront:Distribution',
+          'apigateway:RestApi',
+          'apigateway:HttpApi'
+        ]
+      RETURN labels(r) AS cloud,
+             r.resource_type AS resource_type,
+             COALESCE(r.arn, r.resource_id) AS resource_id,
+             r.name AS name,
+             r.region AS region,
+             'Resource has public network access — restrict to private/VPC connectivity' AS issue
+      ORDER BY cloud, resource_type, name
+      LIMIT 100
+    recommendation: >
+      Disable public access on all data and internal compute resources.
+      Use VPN, Direct Connect, ExpressRoute, or Cloud Interconnect for access.
+      Use private endpoints / VPC endpoints for service connectivity.
+    mitre: ["T1190 - Exploit Public-Facing Application", "T1133 - External Remote Services"]
+    references: []
+
+  - id: XCLOUD-LOG-001
+    title: "All services should have logging enabled"
+    severity: MEDIUM
+    description: >
+      Resources without logging enabled provide no visibility into access patterns,
+      errors, or security events. Logging is a prerequisite for threat detection,
+      incident investigation, and compliance reporting.
+    cypher: |
+      MATCH (r:Resource)
+      WHERE r.scan_start_ms >= $scan_start
+              AND r.resource_type IN [
+        'eks:Cluster', 'rds:DBInstance', 'redshift:Cluster',
+        'apigateway:RestApi', 'apigateway:HttpApi',
+        'cloudfront:Distribution', 'ecs:TaskDefinition',
+        'Microsoft.ContainerService/managedClusters',
+        'Microsoft.ApiManagement/service',
+        'container:Cluster', 'sqladmin:Instance'
+      ]
+      AND (r.logging_enabled = false OR r.logging_enabled IS NULL)
+      RETURN labels(r) AS cloud,
+             r.resource_type AS resource_type,
+             COALESCE(r.arn, r.resource_id) AS resource_id,
+             r.name AS name,
+             r.region AS region,
+             'Service has no logging enabled — enable audit/access/control-plane logging' AS issue
+      ORDER BY cloud, resource_type, name
+      LIMIT 100
+    recommendation: >
+      AWS: Enable CloudWatch logging, CloudTrail data events, VPC Flow Logs.
+      Azure: Enable Diagnostic Settings to Log Analytics Workspace.
+      GCP: Enable Cloud Audit Logs (admin activity + data access).
+    mitre: ["T1562.008 - Disable or Modify Cloud Logs"]
+    references: []
+
+  - id: XCLOUD-BACKUP-001
+    title: "All databases should have automated backups enabled"
+    severity: HIGH
+    description: >
+      Databases without automated backups have no recovery path after data loss
+      from ransomware, accidental deletion, or corruption. Backup is a fundamental
+      availability and continuity control.
+    cypher: |
+      MATCH (r:Resource)
+      WHERE r.scan_start_ms >= $scan_start
+              AND r.resource_type IN [
+        'rds:DBInstance', 'dynamodb:Table',
+        'Microsoft.Sql/servers/databases',
+        'sqladmin:Instance'
+      ]
+      AND (r.backup_enabled = false OR r.backup_enabled IS NULL)
+      RETURN labels(r) AS cloud,
+             r.resource_type AS resource_type,
+             COALESCE(r.arn, r.resource_id) AS resource_id,
+             r.name AS name,
+             r.region AS region,
+             'Database has no automated backup — enable with minimum 7-day retention' AS issue
+      ORDER BY cloud, resource_type, name
+    recommendation: >
+      AWS RDS: Set BackupRetentionPeriod >= 7.
+      DynamoDB: Enable Point-in-Time Recovery.
+      Azure SQL: Enabled by default — verify retention period.
+      Cloud SQL: Enable automated backups with PITR.
+    mitre: ["T1485 - Data Destruction"]
+    references: []
+
+  - id: XCLOUD-TAG-001
+    title: "All resources should have owner and environment tags"
+    severity: LOW
+    description: >
+      Resources without owner and environment tags cannot be attributed to a team
+      during a security incident, cannot be included in cost allocation reports,
+      and are invisible to policy-based governance tools.
+    cypher: |
+      MATCH (r:Resource)
+      WHERE r.scan_start_ms >= $scan_start
+              AND (r.tags = '{}' OR r.tags IS NULL)
+        AND NOT r.resource_type IN ['cloudfront:Distribution']
+      RETURN labels(r) AS cloud,
+             r.resource_type AS resource_type,
+             COALESCE(r.arn, r.resource_id) AS resource_id,
+             r.name AS name,
+             r.region AS region,
+             'Resource has no tags — add owner, environment, and team tags' AS issue
+      ORDER BY cloud, resource_type, name
+      LIMIT 200
+    recommendation: >
+      Enforce mandatory tags via AWS Organizations Tag Policies, Azure Policy,
+      or GCP Organization Policy. Required tags: owner, environment, team, cost-center.
+    mitre: []
+    references: []
+
+  - id: XCLOUD-AUTH-001
+    title: "Services should use managed identity authentication not stored keys"
+    severity: HIGH
+    description: >
+      Services authenticating with stored API keys, connection strings, or
+      passwords create long-lived credentials that are difficult to rotate and
+      often end up in source code or environment variables.
+    cypher: |
+      MATCH (r:Resource)
+      WHERE r.scan_start_ms >= $scan_start
+              AND (r.auth_type = 'none' OR r.auth_type = '' OR r.auth_type IS NULL)
+        AND r.resource_type IN [
+          'elasticache:Cluster',
+          'Microsoft.Web/sites',
+          'Microsoft.ContainerService/managedClusters',
+          'run:Service', 'cloudfunctions:Function'
+        ]
+      RETURN labels(r) AS cloud,
+             r.resource_type AS resource_type,
+             COALESCE(r.arn, r.resource_id) AS resource_id,
+             r.name AS name,
+             r.region AS region,
+             'Service has no managed identity auth — enable IAM/MSI/Workload Identity' AS issue
+      ORDER BY cloud, resource_type, name
+      LIMIT 50
+    recommendation: >
+      AWS: Use IAM roles, IRSA for EKS, execution roles for Lambda/ECS.
+      Azure: Enable System-Assigned Managed Identity on all services.
+      GCP: Use Workload Identity for GKE, service accounts for Functions/Cloud Run.
+    mitre: ["T1078 - Valid Accounts"]
+    references: []

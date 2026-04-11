@@ -1,0 +1,416 @@
+# GCP Application & Data Plane Security Checks
+# IamWatching v2.0 | Aniza Corp
+
+framework: GCP-SECURITY
+description: >
+  Security checks for GCP compute, data, messaging, and storage services:
+  Compute Engine, Cloud Functions, Cloud Run, GKE, API Gateway,
+  Cloud Storage, BigQuery, Cloud SQL, Pub/Sub, Memorystore.
+
+checks:
+
+  # ── GKE ───────────────────────────────────────────────────────────────────
+
+  - id: GCP-GKE-001
+    title: "GKE clusters should not have a public control plane endpoint"
+    severity: CRITICAL
+    description: >
+      GKE clusters with a public control plane endpoint expose the Kubernetes
+      API server to the internet. Even with authentication, public endpoints
+      are targeted for credential attacks and known vulnerability exploitation.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'container:Cluster'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+         OR NOT r.metadata CONTAINS '"private_cluster": true'
+      RETURN r.resource_id AS cluster_id,
+             r.name AS cluster_name,
+             r.region AS region,
+             r.account_id AS project_id,
+             'GKE cluster has public control plane — enable private cluster or restrict master CIDR' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Use Private Clusters with enablePrivateEndpoint=true. If public endpoint
+      is required, configure masterAuthorizedNetworksConfig to restrict access
+      to specific CIDR ranges.
+    mitre: ["T1133 - External Remote Services"]
+    references: ["https://cloud.google.com/kubernetes-engine/docs/how-to/private-clusters"]
+
+  - id: GCP-GKE-002
+    title: "GKE clusters should have Workload Identity enabled"
+    severity: HIGH
+    description: >
+      Without Workload Identity, GKE pods use the Kubernetes metadata server to
+      access the node's service account credentials — giving all pods on a node
+      the same Google API access. Workload Identity binds per-Kubernetes-SA
+      credentials to specific pods.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'container:Cluster'})
+      WHERE NOT r.metadata CONTAINS '"workload_identity": true'
+        AND r.scan_start_ms >= $scan_start
+         AND NOT r.metadata CONTAINS 'workloadIdentityConfig'
+      RETURN r.resource_id AS cluster_id,
+             r.name AS cluster_name,
+             r.region AS region,
+             'GKE cluster does not use Workload Identity — pods share node SA credentials' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable Workload Identity Federation on the cluster. Annotate Kubernetes
+      Service Accounts with the GSA email. Remove broad permissions from node SA.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity"]
+
+  - id: GCP-GKE-003
+    title: "GKE clusters should have Binary Authorization enabled"
+    severity: MEDIUM
+    description: >
+      Binary Authorization ensures only verified, signed container images can
+      be deployed to GKE. Without it, a supply chain attack or insider threat
+      can deploy arbitrary containers to production clusters.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'container:Cluster'})
+      WHERE NOT r.metadata CONTAINS '"binary_authorization": true'
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS cluster_id,
+             r.name AS cluster_name,
+             r.region AS region,
+             'GKE cluster has no Binary Authorization — container supply chain is unverified' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable Binary Authorization. Configure an attestation policy requiring
+      a Container Analysis attestor signature. Use DryRun mode initially
+      to assess impact before enforcement.
+    mitre: ["T1195.002 - Compromise Software Supply Chain"]
+    references: ["https://cloud.google.com/binary-authorization/docs"]
+
+  - id: GCP-GKE-004
+    title: "GKE clusters should use Google-managed database encryption"
+    severity: MEDIUM
+    description: >
+      GKE etcd stores Kubernetes secrets unencrypted by default at the infrastructure
+      level. Application-layer secrets encryption using Cloud KMS encrypts secret
+      data before it reaches etcd.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'container:Cluster'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS cluster_id,
+             r.name AS cluster_name,
+             r.region AS region,
+             'GKE secrets not encrypted with Cloud KMS — enable application-layer encryption' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable Application-Layer Secrets Encryption using a Cloud KMS key.
+      This encrypts Kubernetes secrets before storage in etcd.
+    mitre: ["T1552.001 - Credentials In Files"]
+    references: ["https://cloud.google.com/kubernetes-engine/docs/how-to/encrypting-secrets"]
+
+  # ── Cloud Functions / Cloud Run ───────────────────────────────────────────
+
+  - id: GCP-FUNC-001
+    title: "Cloud Functions should not allow unauthenticated invocations"
+    severity: HIGH
+    description: >
+      Cloud Functions with allUsers in the IAM policy can be invoked by anyone
+      on the internet without authentication. Only functions serving public HTTP
+      endpoints should allow unauthenticated invocations.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'cloudfunctions:Function'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS function_id,
+             r.name AS function_name,
+             r.region AS region,
+             r.account_id AS project_id,
+             'Cloud Function allows unauthenticated invocations — restrict to authenticated callers' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Remove allUsers and allAuthenticatedUsers from the function IAM policy.
+      Use Cloud IAM conditions and service accounts for caller authentication.
+    mitre: ["T1190 - Exploit Public-Facing Application"]
+    references: ["https://cloud.google.com/functions/docs/securing/managing-access-iam"]
+
+  - id: GCP-FUNC-002
+    title: "Cloud Functions should not use environment variables for secrets"
+    severity: MEDIUM
+    description: >
+      Secrets stored in Cloud Function environment variables are visible to
+      anyone with cloud.functions.get permission and may appear in logs.
+      Use Secret Manager with IAM-controlled access instead.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'cloudfunctions:Function'})
+      WHERE r.has_env_vars = true
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS function_id,
+             r.name AS function_name,
+             r.region AS region,
+             'Cloud Function has environment variables — verify no secrets; use Secret Manager' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Store all secrets in Google Secret Manager. Reference secrets in functions
+      via mounted volumes (secret mounts) or the Secret Manager API with
+      a dedicated service account.
+    mitre: ["T1552.001 - Credentials In Files"]
+    references: ["https://cloud.google.com/functions/docs/configuring/secrets"]
+
+  - id: GCP-CLOUDRUN-001
+    title: "Cloud Run services should require authentication"
+    severity: HIGH
+    description: >
+      Cloud Run services with ingress=all and no authentication requirement are
+      publicly accessible without any identity verification. Internal services
+      should require Google Identity tokens.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'run:Service'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+         AND r.auth_type = 'none'
+      RETURN r.resource_id AS service_id,
+             r.name AS service_name,
+             r.region AS region,
+             'Cloud Run service allows unauthenticated access — require authentication' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Remove allUsers from Cloud Run IAM policy. Set ingress to internal-and-cloud-load-balancing
+      for internal services. Use --no-allow-unauthenticated flag on deployment.
+    mitre: ["T1190 - Exploit Public-Facing Application"]
+    references: ["https://cloud.google.com/run/docs/authenticating/overview"]
+
+  # ── Cloud Storage ─────────────────────────────────────────────────────────
+
+  - id: GCP-GCS-001
+    title: "Cloud Storage buckets should not be publicly accessible"
+    severity: CRITICAL
+    description: >
+      GCS buckets with allUsers or allAuthenticatedUsers in IAM policy expose
+      data to the entire internet or all Google accounts respectively. Public
+      buckets have caused major data breaches at scale.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'storage:Bucket'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS bucket_id,
+             r.name AS bucket_name,
+             r.region AS region,
+             r.account_id AS project_id,
+             'GCS bucket is publicly accessible — remove allUsers/allAuthenticatedUsers from IAM' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Remove allUsers and allAuthenticatedUsers from bucket IAM. Enable uniform
+      bucket-level access. Enable Public Access Prevention at org/folder level via
+      Organization Policy (constraints/storage.publicAccessPrevention).
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://cloud.google.com/storage/docs/access-control/making-data-public"]
+
+  - id: GCP-GCS-002
+    title: "Cloud Storage buckets should use customer-managed encryption keys"
+    severity: MEDIUM
+    description: >
+      GCS uses Google-managed encryption keys by default. For regulated workloads,
+      customer-managed encryption keys (CMEK) in Cloud KMS provide key custody
+      and usage auditing via Cloud Audit Logs.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'storage:Bucket'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS bucket_id,
+             r.name AS bucket_name,
+             r.region AS region,
+             'GCS bucket uses Google-managed encryption — consider CMEK for regulated data' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Configure a default CMEK for the bucket using Cloud KMS. Grant
+      roles/cloudkms.cryptoKeyEncrypterDecrypter to the Cloud Storage service account.
+    mitre: ["T1005 - Data from Local System"]
+    references: ["https://cloud.google.com/storage/docs/encryption/customer-managed-keys"]
+
+  - id: GCP-GCS-003
+    title: "Cloud Storage buckets should have versioning enabled"
+    severity: MEDIUM
+    description: >
+      Without versioning, deleted or overwritten objects cannot be recovered.
+      GCS versioning retains previous versions, protecting against accidental
+      deletion and ransomware attacks that overwrite objects.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'storage:Bucket'})
+      WHERE r.versioning_enabled = false OR r.versioning_enabled IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS bucket_id,
+             r.name AS bucket_name,
+             r.region AS region,
+             'GCS bucket has no versioning — enable for recovery from deletion/corruption' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 100
+    recommendation: >
+      Enable versioning on all buckets storing important data. Set Object Lifecycle
+      Management policies to delete old versions after 90 days to manage costs.
+    mitre: ["T1485 - Data Destruction"]
+    references: ["https://cloud.google.com/storage/docs/object-versioning"]
+
+  # ── BigQuery ──────────────────────────────────────────────────────────────
+
+  - id: GCP-BQ-001
+    title: "BigQuery datasets should not be publicly accessible"
+    severity: CRITICAL
+    description: >
+      BigQuery datasets accessible to allUsers or allAuthenticatedUsers expose
+      the entire data warehouse. BigQuery public datasets have led to significant
+      data breaches and compliance violations.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'bigquery:Dataset'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS dataset_id,
+             r.name AS dataset_name,
+             r.region AS region,
+             r.account_id AS project_id,
+             'BigQuery dataset is publicly accessible — remove allUsers/allAuthenticatedUsers' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Remove allUsers and allAuthenticatedUsers from dataset IAM policies.
+      Use VPC Service Controls to restrict BigQuery API access to your VPC.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://cloud.google.com/bigquery/docs/access-control"]
+
+  - id: GCP-BQ-002
+    title: "BigQuery tables should use customer-managed encryption keys"
+    severity: MEDIUM
+    description: >
+      BigQuery encrypts data by default with Google-managed keys. For regulated
+      datasets (HIPAA, PCI, GDPR), CMEK provides independent key control,
+      rotation, and Cloud KMS audit logs for every encryption operation.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'bigquery:Dataset'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS dataset_id,
+             r.name AS dataset_name,
+             r.region AS region,
+             'BigQuery dataset uses Google-managed encryption — consider CMEK for compliance' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Configure CMEK at the dataset or table level using a Cloud KMS key.
+      Grant BigQuery service account roles/cloudkms.cryptoKeyEncrypterDecrypter.
+    mitre: ["T1005 - Data from Local System"]
+    references: ["https://cloud.google.com/bigquery/docs/customer-managed-encryption"]
+
+  # ── Cloud SQL ─────────────────────────────────────────────────────────────
+
+  - id: GCP-SQL-001
+    title: "Cloud SQL instances should not have public IP assigned"
+    severity: CRITICAL
+    description: >
+      Cloud SQL instances with a public IP expose the database port to the internet.
+      All database connectivity should use Cloud SQL Auth Proxy or private IP
+      within VPC. Public IP exposes the instance to credential attacks.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'sqladmin:Instance'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS instance_id,
+             r.name AS instance_name,
+             r.region AS region,
+             r.account_id AS project_id,
+             'Cloud SQL has public IP — disable and use private IP with Cloud SQL Auth Proxy' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Remove public IP from Cloud SQL. Configure private IP in the appropriate VPC.
+      Use Cloud SQL Auth Proxy for application connectivity (handles TLS and IAM auth).
+    mitre: ["T1190 - Exploit Public-Facing Application"]
+    references: ["https://cloud.google.com/sql/docs/mysql/configure-private-ip"]
+
+  - id: GCP-SQL-002
+    title: "Cloud SQL should require SSL connections"
+    severity: HIGH
+    description: >
+      Cloud SQL instances not requiring SSL allow plaintext database connections
+      that expose credentials and query results to network interception.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'sqladmin:Instance'})
+      WHERE NOT r.metadata CONTAINS '"ssl_required": true'
+        AND r.scan_start_ms >= $scan_start
+         OR r.tls_policy = ''
+      RETURN r.resource_id AS instance_id,
+             r.name AS instance_name,
+             r.region AS region,
+             'Cloud SQL does not require SSL — enable requireSsl in database flags' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Set requireSsl=true in the Cloud SQL instance configuration. Download and
+      configure server CA certificates in applications. Use Cloud SQL Auth Proxy
+      which handles TLS automatically.
+    mitre: ["T1557 - Adversary-in-the-Middle"]
+    references: ["https://cloud.google.com/sql/docs/mysql/authorize-ssl"]
+
+  - id: GCP-SQL-003
+    title: "Cloud SQL should have automated backups enabled"
+    severity: HIGH
+    description: >
+      Without automated backups, Cloud SQL data loss from deletion, corruption,
+      or ransomware cannot be recovered. Point-in-time recovery requires both
+      automated backups and binary logging/WAL.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'sqladmin:Instance'})
+      WHERE r.backup_enabled = false OR r.backup_enabled IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS instance_id,
+             r.name AS instance_name,
+             r.region AS region,
+             'Cloud SQL has no automated backups — enable with 7+ day retention' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable automated backups with a 7-day minimum retention period.
+      Enable point-in-time recovery (binary logging for MySQL, WAL for PostgreSQL).
+    mitre: ["T1485 - Data Destruction"]
+    references: ["https://cloud.google.com/sql/docs/mysql/backup-recovery/backups"]
+
+  # ── Pub/Sub ───────────────────────────────────────────────────────────────
+
+  - id: GCP-PUBSUB-001
+    title: "Pub/Sub topics should use customer-managed encryption keys"
+    severity: MEDIUM
+    description: >
+      Pub/Sub topics are encrypted with Google-managed keys by default. Topics
+      carrying sensitive event data (payment events, PII changes, audit events)
+      should use customer-managed KMS keys for compliance and key custody.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'pubsub:Topic'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS topic_id,
+             r.name AS topic_name,
+             r.region AS region,
+             r.account_id AS project_id,
+             'Pub/Sub topic uses Google-managed encryption — consider CMEK for regulated data' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Configure a CMEK on the topic using a Cloud KMS key.
+      Grant Pub/Sub service account roles/cloudkms.cryptoKeyEncrypterDecrypter.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://cloud.google.com/pubsub/docs/encryption"]
+
+  - id: GCP-PUBSUB-002
+    title: "Pub/Sub topics should not allow unauthenticated publish access"
+    severity: HIGH
+    description: >
+      Pub/Sub topics with allUsers or allAuthenticatedUsers as publishers allow
+      anyone to inject arbitrary messages into the stream, potentially causing
+      denial of service or application logic manipulation.
+    cypher: |
+      MATCH (r:GCPResource {resource_type: 'pubsub:Topic'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS topic_id,
+             r.name AS topic_name,
+             r.region AS region,
+             'Pub/Sub topic allows unauthenticated publishing — restrict to known service accounts' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Remove allUsers and allAuthenticatedUsers from topic IAM. Grant roles/pubsub.publisher
+      only to specific service accounts that need to publish.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://cloud.google.com/pubsub/docs/access-control"]

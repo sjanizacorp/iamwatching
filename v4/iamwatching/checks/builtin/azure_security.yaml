@@ -1,0 +1,343 @@
+# Azure Application & Data Plane Security Checks
+# IamWatching v2.0 | Aniza Corp
+# Checks use AzureResource node properties:
+#   r.encrypted, r.public_access, r.logging_enabled, r.auth_type, r.metadata
+
+framework: AZURE-SECURITY
+description: >
+  Security checks for Azure compute, data, messaging, and storage services:
+  VMs, Functions, App Service, AKS, API Management, Service Bus,
+  Blob Storage, SQL Database, Cosmos DB.
+
+checks:
+
+  # ── Azure Compute ─────────────────────────────────────────────────────────
+
+  - id: AZ-VM-001
+    title: "Azure VMs should have disk encryption enabled"
+    severity: HIGH
+    description: >
+      Azure VM OS and data disks without encryption expose data if physical
+      storage is accessed or snapshots are exfiltrated. Azure Disk Encryption
+      uses BitLocker/DM-Crypt with keys stored in Key Vault.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.Compute/virtualMachines'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS vm_id,
+             r.name AS vm_name,
+             r.region AS region,
+             r.account_id AS subscription_id,
+             'Azure VM does not have disk encryption enabled — enable ADE or SSE with CMK' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable Azure Disk Encryption (ADE) using a Key Vault key, or enable
+      Server-Side Encryption (SSE) with a customer-managed key in Disk Encryption Sets.
+    mitre: ["T1005 - Data from Local System"]
+    references: ["https://docs.microsoft.com/en-us/azure/virtual-machines/disk-encryption-overview"]
+
+  - id: AZ-VM-002
+    title: "Azure VMs should use managed identities instead of stored credentials"
+    severity: HIGH
+    description: >
+      Storing service account credentials or connection strings in VM configuration
+      creates long-lived secrets that are hard to rotate. Managed Identities provide
+      token-based Azure AD authentication without any stored credentials.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.Compute/virtualMachines'})
+      WHERE r.auth_type = '' OR r.auth_type IS NULL
+        AND r.scan_start_ms >= $scan_start
+         OR NOT r.metadata CONTAINS 'identity'
+      RETURN r.resource_id AS vm_id,
+             r.name AS vm_name,
+             r.region AS region,
+             'Verify VM uses Managed Identity for service-to-service authentication' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Assign a System-Assigned or User-Assigned Managed Identity to each VM.
+      Grant the identity only the RBAC roles it needs. Remove all stored credentials.
+    mitre: ["T1078 - Valid Accounts"]
+    references: ["https://docs.microsoft.com/en-us/azure/active-directory/managed-identities-azure-resources/overview"]
+
+  - id: AZ-FUNC-001
+    title: "Azure Functions should use Managed Identity for authentication"
+    severity: HIGH
+    description: >
+      Azure Functions storing connection strings, storage keys, or API keys in
+      Application Settings create long-lived secrets that need manual rotation.
+      Managed Identity eliminates stored credentials entirely.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.Web/sites'})
+      WHERE r.has_env_vars = true
+        AND r.scan_start_ms >= $scan_start
+         AND (r.auth_type = '' OR r.auth_type IS NULL)
+      RETURN r.resource_id AS function_id,
+             r.name AS function_name,
+             r.region AS region,
+             'Azure Function has environment variables but no Managed Identity — review for stored secrets' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Enable Managed Identity on the Function App. Replace connection strings
+      with Key Vault references using @Microsoft.KeyVault() syntax.
+    mitre: ["T1552.001 - Credentials In Files"]
+    references: ["https://docs.microsoft.com/en-us/azure/app-service/overview-managed-identity"]
+
+  - id: AZ-AKS-001
+    title: "AKS clusters should have RBAC enabled"
+    severity: CRITICAL
+    description: >
+      AKS without Kubernetes RBAC has no access control on the Kubernetes API.
+      Any authenticated user can perform any operation in any namespace,
+      including creating privileged pods and accessing secrets.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.ContainerService/managedClusters'})
+      WHERE NOT r.metadata CONTAINS '"rbac_enabled": true'
+        AND r.scan_start_ms >= $scan_start
+         OR NOT r.metadata CONTAINS 'rbac'
+      RETURN r.resource_id AS cluster_id,
+             r.name AS cluster_name,
+             r.region AS region,
+             'AKS cluster may not have Kubernetes RBAC enabled — verify and enable' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable Kubernetes RBAC and Azure AD integration for AKS. Use Azure AD
+      groups mapped to Kubernetes ClusterRoles. Disable local accounts.
+    mitre: ["T1078 - Valid Accounts"]
+    references: ["https://docs.microsoft.com/en-us/azure/aks/azure-ad-rbac"]
+
+  - id: AZ-AKS-002
+    title: "AKS clusters should restrict API server access to authorised IP ranges"
+    severity: HIGH
+    description: >
+      An AKS API server accessible from any IP enables brute-force attacks
+      on credentials and exploitation of kubectl vulnerabilities. Access should
+      be restricted to VNet, VPN, or specific corporate IP ranges.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.ContainerService/managedClusters'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+         OR NOT r.metadata CONTAINS 'authorized_ip'
+      RETURN r.resource_id AS cluster_id,
+             r.name AS cluster_name,
+             r.region AS region,
+             'AKS API server accessible from unrestricted IPs — configure authorizedIPRanges' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Configure API server authorized IP ranges to restrict access to your
+      corporate CIDRs and VPN exit IPs. Use private clusters for highest security.
+    mitre: ["T1133 - External Remote Services"]
+    references: ["https://docs.microsoft.com/en-us/azure/aks/api-server-authorized-ip-ranges"]
+
+  # ── Azure API Management ──────────────────────────────────────────────────
+
+  - id: AZ-APIM-001
+    title: "Azure API Management should enforce HTTPS-only"
+    severity: HIGH
+    description: >
+      API Management gateways allowing HTTP expose API traffic to interception.
+      All API communication should use HTTPS to protect data in transit and
+      prevent credential theft from API headers.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.ApiManagement/service'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS apim_id,
+             r.name AS apim_name,
+             r.region AS region,
+             'APIM gateway may allow HTTP — enforce HTTPS-only and disable HTTP endpoint' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Set customProperties: Microsoft.WindowsAzure.ApiManagement.Gateway.Protocols.Http=false
+      Enforce TLS 1.2 minimum via cipher configuration.
+    mitre: ["T1557 - Adversary-in-the-Middle"]
+    references: ["https://docs.microsoft.com/en-us/azure/api-management/api-management-howto-protect-backend-with-aad"]
+
+  # ── Azure Storage / Blob ──────────────────────────────────────────────────
+
+  - id: AZ-BLOB-001
+    title: "Azure Storage accounts should require HTTPS"
+    severity: HIGH
+    description: >
+      Storage accounts allowing HTTP access expose data transfers to interception.
+      supportsHttpsTrafficOnly should be true on all storage accounts to force
+      all SDK and REST API access over TLS.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.Storage/storageAccounts'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+         OR NOT r.metadata CONTAINS '"https_only": true'
+      RETURN r.resource_id AS storage_id,
+             r.name AS storage_name,
+             r.region AS region,
+             'Storage account may allow HTTP — enable supportsHttpsTrafficOnly' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Set supportsHttpsTrafficOnly=true on all storage accounts. Set minimum
+      TLS version to TLS1_2. Enable infrastructure encryption for double encryption.
+    mitre: ["T1557 - Adversary-in-the-Middle"]
+    references: ["https://docs.microsoft.com/en-us/azure/storage/common/storage-require-secure-transfer"]
+
+  - id: AZ-BLOB-002
+    title: "Azure Storage accounts should not allow anonymous public access"
+    severity: CRITICAL
+    description: >
+      Storage accounts with allowBlobPublicAccess=true permit containers to be
+      configured for anonymous read. This is a leading cause of cloud data leaks.
+      Account-level public access should be disabled.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.Storage/storageAccounts'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS storage_id,
+             r.name AS storage_name,
+             r.region AS region,
+             'Storage account allows public blob access — set allowBlobPublicAccess=false' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Set allowBlobPublicAccess=false at the storage account level. This overrides
+      any container-level public access setting. Enforce via Azure Policy.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://docs.microsoft.com/en-us/azure/storage/blobs/anonymous-read-access-prevent"]
+
+  - id: AZ-BLOB-003
+    title: "Azure Storage accounts should use customer-managed keys"
+    severity: MEDIUM
+    description: >
+      Azure Storage is encrypted at rest by default with Microsoft-managed keys.
+      For regulated data (GDPR, HIPAA, PCI), customer-managed keys in Azure Key Vault
+      provide key custody, rotation control, and usage audit trails.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.Storage/storageAccounts'})
+      WHERE NOT r.metadata CONTAINS '"cmk": true'
+        AND r.scan_start_ms >= $scan_start
+         AND NOT r.metadata CONTAINS 'keyVault'
+      RETURN r.resource_id AS storage_id,
+             r.name AS storage_name,
+             r.region AS region,
+             'Storage account uses Microsoft-managed keys — consider CMK for regulated data' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Configure customer-managed keys using Azure Key Vault. Enable key auto-rotation.
+      Required for HIPAA and some PCI DSS configurations.
+    mitre: ["T1005 - Data from Local System"]
+    references: ["https://docs.microsoft.com/en-us/azure/storage/common/customer-managed-keys-overview"]
+
+  # ── Azure SQL / Cosmos DB ─────────────────────────────────────────────────
+
+  - id: AZ-SQL-001
+    title: "Azure SQL databases should have Transparent Data Encryption enabled"
+    severity: HIGH
+    description: >
+      Azure SQL without Transparent Data Encryption (TDE) stores database files,
+      backups, and transaction logs in plaintext. TDE is the minimum encryption
+      requirement for any production SQL database.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.Sql/servers/databases'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS db_id,
+             r.name AS db_name,
+             r.region AS region,
+             'Azure SQL database has no TDE — enable Transparent Data Encryption' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable TDE on all Azure SQL databases. TDE with Customer Managed Key (CMK)
+      in Key Vault provides BYOK capability for compliance requirements.
+    mitre: ["T1005 - Data from Local System"]
+    references: ["https://docs.microsoft.com/en-us/azure/azure-sql/database/transparent-data-encryption-tde-overview"]
+
+  - id: AZ-SQL-002
+    title: "Azure SQL should have Advanced Threat Protection enabled"
+    severity: MEDIUM
+    description: >
+      Azure Defender for SQL (formerly ATP) detects anomalous activities including
+      SQL injection attempts, unusual access patterns, and credential brute force.
+      Without it, database-level attacks go undetected.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.Sql/servers'})
+      WHERE NOT r.metadata CONTAINS '"defender_enabled": true'
+        AND r.scan_start_ms >= $scan_start
+         AND NOT r.metadata CONTAINS '"atp_enabled": true'
+      RETURN r.resource_id AS server_id,
+             r.name AS server_name,
+             r.region AS region,
+             'Azure SQL Server has no Advanced Threat Protection — enable Defender for SQL' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable Microsoft Defender for SQL at the subscription level via
+      Defender for Cloud. Configure email notifications for critical alerts.
+    mitre: ["T1190 - Exploit Public-Facing Application"]
+    references: ["https://docs.microsoft.com/en-us/azure/azure-sql/database/threat-detection-overview"]
+
+  - id: AZ-COSMOS-001
+    title: "Cosmos DB accounts should disable public endpoint access"
+    severity: HIGH
+    description: >
+      Cosmos DB accounts accessible from all networks expose the data store
+      to credential brute-force and exploitation of API vulnerabilities from
+      the entire internet.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.DocumentDB/databaseAccounts'})
+      WHERE r.public_access = true OR NOT r.metadata CONTAINS 'privateEndpoint'
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.resource_id AS cosmos_id,
+             r.name AS cosmos_name,
+             r.region AS region,
+             'Cosmos DB has public network access — restrict to private endpoints or IP rules' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Disable public network access. Use Private Endpoints for application connectivity.
+      Configure IP firewall rules if private endpoints are not feasible.
+    mitre: ["T1190 - Exploit Public-Facing Application"]
+    references: ["https://docs.microsoft.com/en-us/azure/cosmos-db/how-to-configure-private-endpoints"]
+
+  # ── Azure Service Bus / Event Hubs ────────────────────────────────────────
+
+  - id: AZ-SB-001
+    title: "Service Bus namespaces should use private endpoints and disable public access"
+    severity: HIGH
+    description: >
+      Service Bus namespaces with public network access enabled can be reached
+      from the internet. Internal messaging infrastructure should be isolated
+      to private VNet connectivity.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.ServiceBus/namespaces'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+         OR NOT r.metadata CONTAINS 'privateEndpoint'
+      RETURN r.resource_id AS namespace_id,
+             r.name AS namespace_name,
+             r.region AS region,
+             'Service Bus has public network access — configure private endpoints' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Disable public network access on Service Bus namespace. Configure Private
+      Endpoints for application connectivity within VNet.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://docs.microsoft.com/en-us/azure/service-bus-messaging/network-security"]
+
+  - id: AZ-SB-002
+    title: "Service Bus should not use root shared access keys"
+    severity: HIGH
+    description: >
+      Service Bus namespaces have root-level Shared Access Signature (SAS) keys
+      that grant full management access. Applications should use scoped SAS keys
+      with only Send or Listen permissions, not the root keys.
+    cypher: |
+      MATCH (r:AzureResource {resource_type: 'Microsoft.ServiceBus/namespaces'})
+      WHERE r.auth_type = 'sas' OR r.auth_type = ''
+        AND r.scan_start_ms >= $scan_start
+         OR NOT r.metadata CONTAINS '"managed_identity": true'
+      RETURN r.resource_id AS namespace_id,
+             r.name AS namespace_name,
+             r.region AS region,
+             'Service Bus may use root SAS keys — use scoped keys or Managed Identity' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Use Azure AD authentication with Managed Identity instead of SAS keys.
+      If SAS is required, create purpose-specific keys with minimum required permissions.
+    mitre: ["T1078 - Valid Accounts"]
+    references: ["https://docs.microsoft.com/en-us/azure/service-bus-messaging/authenticate-application"]

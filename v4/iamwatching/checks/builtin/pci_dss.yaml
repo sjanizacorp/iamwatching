@@ -1,0 +1,187 @@
+# PCI DSS v4.0.1 — IAM-Relevant Requirements
+# Source: https://www.pcisecuritystandards.org/
+# Applicable to organizations processing, storing, or transmitting cardholder data.
+
+framework: PCI-DSS-4.0
+description: >
+  PCI DSS v4.0.1 identity and access management controls.
+  Requirements 7 (Restrict Access), 8 (Identify and Authenticate).
+
+checks:
+
+  - id: PCI-REQ-7.2.1
+    title: "PCI 7.2.1: Least privilege access — individual job function policies"
+    severity: HIGH
+    description: >
+      PCI DSS Req 7.2.1: Access to system components and cardholder data is
+      restricted to only those individuals whose job requires such access.
+      Wildcard or admin policies violate this requirement.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WHERE p.attached_policies CONTAINS 'AdministratorAccess'
+        AND p.scan_start_ms >= $scan_start
+         OR p.inline_policies CONTAINS '"Action": "*"'
+         OR p.attached_policies CONTAINS 'PowerUserAccess'
+      RETURN p.arn AS principal_arn,
+             p.name AS name,
+             p.principal_type AS type,
+             'PCI 7.2.1: Principal has admin/wildcard access — violates least privilege' AS issue
+      ORDER BY p.principal_type, p.name
+    recommendation: >
+      Define access policies based on job function. Remove all wildcard and
+      admin-level policies. Document business justification for elevated access.
+    mitre: ["T1078 - Valid Accounts"]
+    references: ["https://www.pcisecuritystandards.org/document_library/"]
+
+  - id: PCI-REQ-7.2.4
+    title: "PCI 7.2.4: User accounts reviewed at least once every 6 months"
+    severity: MEDIUM
+    description: >
+      PCI DSS Req 7.2.4: All user accounts and related access privileges are
+      reviewed at least once every 6 months to confirm access remains appropriate.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE NOT p.name = 'root'
+        AND p.scan_start_ms >= $scan_start
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             p.tags AS tags,
+             'Verify this user account was reviewed within the last 6 months per PCI 7.2.4' AS action
+      ORDER BY p.name
+      LIMIT 100
+    recommendation: >
+      Implement formal semi-annual user access reviews. Use the tag last_reviewed_date
+      to track review status. Disable accounts not reviewed in 180+ days.
+    mitre: ["T1078 - Valid Accounts"]
+    references: ["https://www.pcisecuritystandards.org/document_library/"]
+
+  - id: PCI-REQ-8.2.1
+    title: "PCI 8.2.1: Unique IDs for all users — no shared accounts"
+    severity: HIGH
+    description: >
+      PCI DSS Req 8.2.1: All users must have a unique ID before allowing them
+      to access system components or cardholder data. Shared or generic accounts
+      prevent individual accountability.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE toLower(p.name) IN ['admin', 'administrator', 'root', 'user',
+        AND p.scan_start_ms >= $scan_start
+                                  'test', 'guest', 'service', 'shared',
+                                  'common', 'default', 'generic']
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             'PCI 8.2.1: Generic/shared account name — violates unique ID requirement' AS issue
+    recommendation: >
+      Replace all generic/shared accounts with individually named accounts.
+      Each account must be attributable to a single named individual or service.
+    mitre: ["T1078 - Valid Accounts"]
+    references: ["https://www.pcisecuritystandards.org/document_library/"]
+
+  - id: PCI-REQ-8.3.4
+    title: "PCI 8.3.4: Password complexity requirements"
+    severity: MEDIUM
+    description: >
+      PCI DSS Req 8.3.4: Passwords for user accounts must meet minimum complexity
+      requirements including length (at minimum 12 characters for PCI v4.0.1).
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WITH count(p) AS user_count
+      WHERE user_count > 0
+        AND p.scan_start_ms >= $scan_start
+      RETURN user_count,
+             'Manual check: IAM password policy must require 12+ characters per PCI 8.3.4' AS action
+      LIMIT 1
+    recommendation: >
+      Set IAM password policy minimum length to 14 (exceeds PCI minimum of 12).
+      Require complexity: uppercase, lowercase, numbers, symbols.
+    mitre: ["T1110 - Brute Force"]
+    references: ["https://www.pcisecuritystandards.org/document_library/"]
+
+  - id: PCI-REQ-8.3.6
+    title: "PCI 8.3.6: Password history — prevent reuse of last 4 passwords"
+    severity: MEDIUM
+    description: >
+      PCI DSS Req 8.3.6: Passwords cannot be the same as any of the last four
+      previously used passwords. PCI v4.0.1 requires preventing reuse of the
+      last 4; CIS extends this to 24.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WITH count(p) AS user_count
+      WHERE user_count > 0
+        AND p.scan_start_ms >= $scan_start
+      RETURN user_count,
+             'Manual check: IAM password policy must prevent reuse of last 4+ passwords per PCI 8.3.6' AS action
+      LIMIT 1
+    recommendation: >
+      Set IAM password policy password reuse prevention to at least 24 (best practice).
+    mitre: ["T1110 - Brute Force"]
+    references: ["https://www.pcisecuritystandards.org/document_library/"]
+
+  - id: PCI-REQ-8.3.9
+    title: "PCI 8.3.9: Change passwords every 90 days for non-MFA users"
+    severity: HIGH
+    description: >
+      PCI DSS Req 8.3.9: If passwords are used as authentication factors for
+      users without MFA, they must be changed at least once every 90 days.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE NOT p.name = 'root'
+        AND p.scan_start_ms >= $scan_start
+        AND NOT p.metadata CONTAINS '"mfa_active": true'
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             'PCI 8.3.9: User without MFA — password must be rotated every 90 days' AS issue
+      ORDER BY p.name
+    recommendation: >
+      Enable MFA for all users (then 90-day password rotation is not required).
+      Or set IAM password policy max age to 90 days and enforce MFA immediately.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://www.pcisecuritystandards.org/document_library/"]
+
+  - id: PCI-REQ-8.4.2
+    title: "PCI 8.4.2: MFA for all access to CDE — multi-factor authentication required"
+    severity: CRITICAL
+    description: >
+      PCI DSS Req 8.4.2: MFA is implemented for all access into the cardholder
+      data environment (CDE). All IAM users must have MFA enabled.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE NOT p.name = 'root'
+        AND p.scan_start_ms >= $scan_start
+        AND NOT p.metadata CONTAINS '"mfa_active": true'
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             'PCI 8.4.2 CRITICAL: User does not have MFA — all CDE access requires MFA' AS issue
+      ORDER BY p.name
+    recommendation: >
+      Immediately enforce MFA for all IAM users. Use an SCP to deny all console
+      access without MFA. This is a PCI compliance blocking finding.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://www.pcisecuritystandards.org/document_library/"]
+
+  - id: PCI-REQ-8.6.1
+    title: "PCI 8.6.1: System/application accounts managed by policies"
+    severity: MEDIUM
+    description: >
+      PCI DSS Req 8.6.1: Use of application and system accounts and associated
+      authentication factors is strictly managed. Service accounts should follow
+      naming conventions and have documented owners.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE NOT p.name = 'root'
+        AND p.scan_start_ms >= $scan_start
+        AND NOT toLower(p.name) STARTS WITH 'svc-'
+        AND NOT toLower(p.name) STARTS WITH 'app-'
+        AND NOT toLower(p.name) STARTS WITH 'service-'
+        AND (p.attached_policy_count > 0 OR p.inline_policy_count > 0)
+        AND NOT p.metadata CONTAINS 'password_last_used'
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             'Possible service account without naming convention — PCI 8.6.1 requires documented management' AS issue
+      ORDER BY p.name
+      LIMIT 50
+    recommendation: >
+      Use naming convention svc-<service>-<env> for all service accounts.
+      Document owner, purpose, and last review date via tags.
+    mitre: ["T1078 - Valid Accounts"]
+    references: ["https://www.pcisecuritystandards.org/document_library/"]

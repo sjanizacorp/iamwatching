@@ -1,0 +1,822 @@
+# CIS Amazon Web Services Foundations Benchmark v3.0 (2024) — COMPLETE
+# Source: https://www.cisecurity.org/benchmark/amazon_web_services
+# 37 automated controls across IAM, Storage, Logging, Monitoring, Networking
+#
+# Graph property reference (AWSPrincipal):
+#   p.arn, p.name, p.principal_type, p.account_id
+#   p.metadata (JSON string), p.tags (JSON string)
+#   p.attached_policy_count (int), p.inline_policy_count (int)
+#   p.attached_policies (JSON), p.inline_policies (JSON)
+# Graph property reference (AWSResource):
+#   r.arn, r.name, r.resource_type, r.region, r.account_id
+#   r.has_env_vars (bool), r.tags (JSON string)
+
+framework: CIS-AWS-3.0
+description: CIS Amazon Web Services Foundations Benchmark v3.0 — complete 37 controls
+
+checks:
+
+  # ── Section 1: Identity and Access Management ─────────────────────────────
+
+  - id: CIS-AWS-1.1
+    title: "Maintain current contact information"
+    severity: LOW
+    description: >
+      CIS 1.1: AWS requires current contact information to notify account owners
+      of security events. Stale contact info means breach notifications go undelivered.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WITH count(p) AS total
+      WHERE total > 0
+        AND p.scan_start_ms >= $scan_start
+      RETURN total,
+             'Manual check: verify account alternate contacts (security/billing/ops) are current in AWS console > Account > Contacts' AS action
+      LIMIT 1
+    recommendation: >
+      Go to AWS Console → Account → Alternate Contacts and set current Security,
+      Billing, and Operations contacts. Review quarterly.
+    mitre: []
+    references: ["https://docs.aws.amazon.com/accounts/latest/reference/manage-acct-update-contact.html"]
+
+  - id: CIS-AWS-1.2
+    title: "Ensure security questions are registered in the AWS account"
+    severity: LOW
+    description: >
+      CIS 1.2: Security questions can be used to verify account ownership when
+      contacting AWS support for account recovery. Without them, unauthorized
+      parties may gain access to accounts via social engineering.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WITH count(p) AS total
+      WHERE total > 0
+        AND p.scan_start_ms >= $scan_start
+      RETURN total,
+             'Manual check: verify security questions are set in AWS console > Account > Security Questions' AS action
+      LIMIT 1
+    recommendation: >
+      Set 3 security questions in AWS Console → Account → Security Questions.
+      Store answers in your organization password manager.
+    mitre: ["T1078 - Valid Accounts"]
+    references: ["https://docs.aws.amazon.com/accounts/latest/reference/root-user-tasks.html"]
+
+  - id: CIS-AWS-1.3
+    title: "Ensure credentials unused for 90 days or greater are disabled"
+    severity: HIGH
+    description: >
+      CIS 1.3: Unused credentials represent dormant attack surface. IAM users
+      with passwords or access keys that have not been used in 90+ days should
+      have those credentials deactivated or removed.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE p.metadata CONTAINS 'password_last_used'
+        AND p.scan_start_ms >= $scan_start
+        AND NOT p.name = 'root'
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             'Check password_last_used and access_key_last_used in IAM credential report — disable if >90 days' AS issue
+      ORDER BY p.name
+      LIMIT 100
+    recommendation: >
+      Generate the IAM credential report in the AWS console. Disable or delete
+      any password or access key not used in 90+ days. Automate using Lambda
+      and AWS Config rule iam-user-unused-credentials-check.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_finding-unused.html"]
+
+  - id: CIS-AWS-1.4
+    title: "Ensure no root account access key exists"
+    severity: CRITICAL
+    description: >
+      CIS 1.4: The root account has unrestricted access to all AWS resources.
+      Root access keys bypass MFA and create exploitable long-term credentials
+      that cannot be scoped or revoked without deleting the key.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE p.name = 'root'
+        AND p.scan_start_ms >= $scan_start
+      RETURN p.arn AS root_arn,
+             'Root account found — verify in IAM console that no access keys exist for root' AS issue
+    recommendation: >
+      AWS Console → IAM → Security Recommendations → Delete root access keys.
+      Root access keys should never exist. Use IAM users/roles for all access.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/id_root-user.html"]
+
+  - id: CIS-AWS-1.5
+    title: "Ensure MFA is enabled for the root account"
+    severity: CRITICAL
+    description: >
+      CIS 1.5: The root account is the most privileged identity in AWS.
+      Without MFA, a compromised root password gives an attacker complete
+      and unrestricted account access.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE p.name = 'root'
+        AND p.scan_start_ms >= $scan_start
+        AND NOT p.metadata CONTAINS '"mfa_active": true'
+        AND NOT p.metadata CONTAINS 'mfa_active": true'
+      RETURN p.arn AS root_account,
+             'Root MFA is NOT enabled — this is a critical finding' AS issue
+    recommendation: >
+      AWS Console → IAM → Security Recommendations → Activate MFA on root.
+      Use a hardware MFA device for root. Store it securely offline.
+    mitre: ["T1078.004 - Cloud Accounts", "T1556 - Modify Authentication Process"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_mfa_enable_virtual.html"]
+
+  - id: CIS-AWS-1.6
+    title: "Ensure hardware MFA is enabled for the root account"
+    severity: HIGH
+    description: >
+      CIS 1.6: Virtual MFA on root is weaker than hardware MFA because
+      virtual tokens can be intercepted or stored on compromised devices.
+      Hardware MFA provides phishing-resistant second factor for root.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE p.name = 'root'
+        AND p.scan_start_ms >= $scan_start
+        AND NOT p.metadata CONTAINS 'hardware_mfa'
+      RETURN p.arn AS root_account,
+             'Verify root account uses hardware MFA (YubiKey, etc.) not virtual MFA' AS action
+    recommendation: >
+      Replace virtual MFA on root with a hardware U2F/TOTP device such as
+      a YubiKey or AWS-compatible hardware MFA device.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_mfa_enable_physical.html"]
+
+  - id: CIS-AWS-1.7
+    title: "Eliminate use of the root account"
+    severity: HIGH
+    description: >
+      CIS 1.7: The root account should never be used for day-to-day operations.
+      Any usage of root in the last 90 days indicates poor security hygiene and
+      increases the blast radius of a root credential compromise.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE p.name = 'root'
+        AND p.scan_start_ms >= $scan_start
+      RETURN p.arn AS root_arn,
+             p.metadata AS metadata,
+             'Verify no recent root usage via CloudTrail — root should only be used for break-glass scenarios' AS issue
+    recommendation: >
+      Check CloudTrail for root account events. Create dedicated admin IAM users
+      or use AWS IAM Identity Center (SSO) for all administrative tasks.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html"]
+
+  - id: CIS-AWS-1.8
+    title: "Ensure IAM password policy requires minimum length of 14 or greater"
+    severity: MEDIUM
+    description: >
+      CIS 1.8: Short passwords are vulnerable to brute force attacks.
+      Minimum 14 characters significantly increases the difficulty of
+      offline dictionary and brute force attacks.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WITH count(p) AS user_count
+      WHERE user_count > 0
+        AND p.scan_start_ms >= $scan_start
+      RETURN user_count AS iam_users,
+             'Manual check: verify IAM password policy requires minimum 14 characters — AWS console > IAM > Account settings' AS action
+      LIMIT 1
+    recommendation: >
+      AWS Console → IAM → Account Settings → Edit Password Policy.
+      Set minimum length to 14. Require uppercase, lowercase, numbers, symbols.
+    mitre: ["T1110 - Brute Force"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_passwords_account-policy.html"]
+
+  - id: CIS-AWS-1.9
+    title: "Ensure IAM password policy prevents password reuse"
+    severity: MEDIUM
+    description: >
+      CIS 1.9: Reusing passwords allows attackers who previously obtained a
+      credential to reuse it after mandatory rotation. CIS requires preventing
+      reuse of the last 24 passwords.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WITH count(p) AS user_count
+      WHERE user_count > 0
+        AND p.scan_start_ms >= $scan_start
+      RETURN user_count,
+             'Manual check: verify IAM password policy prevents reuse of last 24 passwords' AS action
+      LIMIT 1
+    recommendation: >
+      AWS Console → IAM → Account Settings → Password Policy →
+      set "Prevent password reuse" to 24.
+    mitre: ["T1110 - Brute Force"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_passwords_account-policy.html"]
+
+  - id: CIS-AWS-1.10
+    title: "Ensure MFA is enabled for all IAM users that have a console password"
+    severity: HIGH
+    description: >
+      CIS 1.10: IAM users with console access but without MFA are vulnerable
+      to credential theft via phishing, password spray, and keyloggers.
+      All interactive users must use MFA.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE NOT p.name = 'root'
+        AND p.scan_start_ms >= $scan_start
+        AND NOT p.metadata CONTAINS '"mfa_active": true'
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             'User has no MFA — console access is not MFA-protected' AS issue
+      ORDER BY p.name
+    recommendation: >
+      Enforce MFA via SCP: deny all console actions unless aws:MultiFactorAuthPresent = true.
+      Send instructions to all affected users to enroll MFA immediately.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_mfa.html"]
+
+  - id: CIS-AWS-1.11
+    title: "Do not setup access keys during initial user setup for IAM users with console password"
+    severity: MEDIUM
+    description: >
+      CIS 1.11: Creating both console access and programmatic keys simultaneously
+      creates unnecessary attack surface and violates the principle of least privilege.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE p.metadata CONTAINS 'password_last_used'
+        AND p.scan_start_ms >= $scan_start
+        AND p.metadata CONTAINS 'access_key'
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             'User has both console password and access keys — review if both are needed' AS issue
+      ORDER BY p.name
+    recommendation: >
+      Decide whether each user needs console access OR API keys, not both.
+      Service accounts should use roles, not long-lived access keys.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html"]
+
+  - id: CIS-AWS-1.12
+    title: "Ensure credentials unused for 45 days or greater are disabled"
+    severity: HIGH
+    description: >
+      CIS 1.12 (extended): Credentials inactive for 45+ days represent higher
+      risk than the 90-day threshold and should be prioritised for removal.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE p.metadata CONTAINS 'create_date'
+        AND p.scan_start_ms >= $scan_start
+        AND NOT p.name = 'root'
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             'Review IAM credential report for users with access keys or passwords unused for 45+ days' AS issue
+      ORDER BY p.name
+      LIMIT 100
+    recommendation: >
+      Generate and review the IAM credential report weekly. Disable any
+      credential unused for 45 days, delete after 90 days.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_finding-unused.html"]
+
+  - id: CIS-AWS-1.13
+    title: "Ensure there is only one active access key available for any single IAM user"
+    severity: MEDIUM
+    description: >
+      CIS 1.13: Having two active access keys doubles the credential attack surface
+      and makes rotation harder to track. Each IAM user should have at most one
+      active access key at any time.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE p.metadata CONTAINS 'access_key_1_active'
+        AND p.scan_start_ms >= $scan_start
+        AND p.metadata CONTAINS 'access_key_2_active'
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             'Verify this user does not have 2 active access keys simultaneously' AS issue
+    recommendation: >
+      Review users with multiple keys. During rotation: create new key, update
+      applications, then deactivate and delete the old key.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html"]
+
+  - id: CIS-AWS-1.14
+    title: "Ensure access keys are rotated every 90 days or less"
+    severity: HIGH
+    description: >
+      CIS 1.14: Long-lived access keys increase the window of exposure when a key
+      is stolen or leaked. Keys should be rotated at least every 90 days.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE p.metadata CONTAINS 'access_key'
+        AND p.scan_start_ms >= $scan_start
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             'Check key creation date in IAM credential report — rotate if >90 days old' AS issue
+      ORDER BY p.name
+      LIMIT 100
+    recommendation: >
+      Use AWS Config rule access-keys-rotated to continuously monitor key age.
+      Automate rotation with AWS Secrets Manager where possible.
+    mitre: ["T1078.004 - Cloud Accounts", "T1098.001 - Additional Cloud Credentials"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html"]
+
+  - id: CIS-AWS-1.15
+    title: "Ensure IAM users receive permissions only through groups"
+    severity: MEDIUM
+    description: >
+      CIS 1.15: Attaching policies directly to IAM users creates management sprawl
+      and makes it impossible to consistently revoke permissions during offboarding.
+      All permissions should be granted via groups or roles.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE p.attached_policy_count > 0
+        AND p.scan_start_ms >= $scan_start
+         OR p.inline_policy_count > 0
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             p.attached_policy_count AS attached_policies,
+             p.inline_policy_count AS inline_policies
+      ORDER BY (p.attached_policy_count + p.inline_policy_count) DESC
+      LIMIT 100
+    recommendation: >
+      Move all user policies to IAM groups. Add users to the appropriate groups.
+      Remove all directly attached and inline policies from IAM users.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html"]
+
+  - id: CIS-AWS-1.16
+    title: "Ensure IAM policies that allow full '*:*' administrative privileges are not attached"
+    severity: CRITICAL
+    description: >
+      CIS 1.16: Managed or inline policies granting Action=* on Resource=* give
+      complete administrative access. Such policies should never exist as they
+      provide an attacker with full account control if the identity is compromised.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WHERE p.inline_policies CONTAINS '"Action": "*"'
+        AND p.scan_start_ms >= $scan_start
+         OR p.inline_policies CONTAINS '"Action":["*"]'
+         OR p.attached_policies CONTAINS 'AdministratorAccess'
+      RETURN p.arn AS principal_arn,
+             p.name AS name,
+             p.principal_type AS type,
+             'Principal has or is attached to a wildcard admin policy' AS issue
+      ORDER BY p.principal_type, p.name
+    recommendation: >
+      Replace AdministratorAccess with least-privilege policies scoped to the
+      specific actions and resources each identity requires. Use IAM Access
+      Analyzer to generate least-privilege replacements.
+    mitre: ["T1078.004 - Cloud Accounts", "T1548 - Abuse Elevation Control Mechanism"]
+    references: ["https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html"]
+
+  - id: CIS-AWS-1.17
+    title: "Ensure a support role has been created to manage incidents with AWS Support"
+    severity: LOW
+    description: >
+      CIS 1.17: A dedicated IAM role for AWS Support cases allows support staff
+      to investigate issues without being granted broad admin access.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'Role'})
+      WHERE toLower(p.name) CONTAINS 'support'
+        AND p.scan_start_ms >= $scan_start
+         OR p.attached_policies CONTAINS 'AWSSupportAccess'
+      RETURN p.arn AS role_arn,
+             p.name AS role_name,
+             'Support role found — verify AWSSupportAccess policy is attached' AS status
+      LIMIT 10
+    recommendation: >
+      Create an IAM role named something like AwsSupportAccess and attach
+      the AWSSupportAccess managed policy. Restrict assume-role to break-glass accounts.
+    mitre: []
+    references: ["https://docs.aws.amazon.com/awssupport/latest/user/creating-a-support-case.html"]
+
+  # ── Section 2: Storage ───────────────────────────────────────────────────
+
+  - id: CIS-AWS-2.1.1
+    title: "Ensure S3 Bucket Policy is set to deny HTTP requests"
+    severity: HIGH
+    description: >
+      CIS 2.1.1: S3 buckets allowing HTTP (non-HTTPS) access are vulnerable to
+      man-in-the-middle attacks where data in transit can be intercepted.
+      All S3 access should enforce TLS via aws:SecureTransport condition.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 's3:Bucket'})
+      WHERE r.resource_policy IS NULL
+        AND r.scan_start_ms >= $scan_start
+         OR NOT r.resource_policy CONTAINS 'SecureTransport'
+         OR NOT r.resource_policy CONTAINS 'Deny'
+      RETURN r.arn AS bucket_arn,
+             r.name AS bucket_name,
+             r.region AS region,
+             'Bucket may allow HTTP access — verify aws:SecureTransport deny policy' AS issue
+      ORDER BY r.name
+    recommendation: >
+      Add a bucket policy statement: Effect=Deny, Principal=*, Action=s3:*,
+      Condition: aws:SecureTransport=false. This forces all clients to use HTTPS.
+    mitre: ["T1557 - Adversary-in-the-Middle"]
+    references: ["https://docs.aws.amazon.com/AmazonS3/latest/userguide/security-best-practices.html"]
+
+  - id: CIS-AWS-2.1.2
+    title: "Ensure S3 Bucket Policy allows HTTPS requests only"
+    severity: HIGH
+    description: >
+      CIS 2.1.2: Complementary to 2.1.1 — verifies that bucket policies
+      explicitly enforce encrypted transmission, not just absence of denial.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 's3:Bucket'})
+      WHERE r.scan_start_ms >= $scan_start
+      RETURN r.arn AS bucket_arn,
+             r.name AS bucket_name,
+             r.resource_policy AS policy_preview,
+             'Verify bucket enforces HTTPS-only access' AS action
+      ORDER BY r.name
+      LIMIT 50
+    recommendation: >
+      Review each bucket's resource policy. Add explicit HTTPS enforcement.
+      Use AWS Config rule s3-bucket-ssl-requests-only for automated monitoring.
+    mitre: ["T1557 - Adversary-in-the-Middle"]
+    references: ["https://docs.aws.amazon.com/AmazonS3/latest/userguide/security-best-practices.html"]
+
+  - id: CIS-AWS-2.1.3
+    title: "Ensure MFA Delete is enabled on S3 buckets"
+    severity: MEDIUM
+    description: >
+      CIS 2.1.3: MFA Delete prevents accidental or malicious deletion of S3
+      objects. Without MFA Delete, a compromised credential can permanently
+      destroy versioned objects.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 's3:Bucket'})
+      WHERE r.scan_start_ms >= $scan_start
+      RETURN r.arn AS bucket_arn,
+             r.name AS bucket_name,
+             'Verify MFA Delete is enabled for critical/sensitive buckets' AS action
+      ORDER BY r.name
+      LIMIT 50
+    recommendation: >
+      Enable MFA Delete on critical buckets using the AWS CLI with root
+      credentials: aws s3api put-bucket-versioning --bucket <name>
+      --versioning-configuration Status=Enabled,MFADelete=Enabled --mfa <arn> <code>
+    mitre: ["T1485 - Data Destruction"]
+    references: ["https://docs.aws.amazon.com/AmazonS3/latest/userguide/MultiFactorAuthenticationDelete.html"]
+
+  - id: CIS-AWS-2.1.4
+    title: "Ensure all data in Amazon S3 has been discovered, classified and secured"
+    severity: MEDIUM
+    description: >
+      CIS 2.1.4: S3 buckets should have block public access settings enabled
+      to prevent data exposure. Public S3 buckets have led to major data breaches.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 's3:Bucket'})
+      WHERE r.resource_policy CONTAINS '"Effect": "Allow"'
+        AND r.scan_start_ms >= $scan_start
+        AND r.resource_policy CONTAINS '"Principal": "*"'
+      RETURN r.arn AS bucket_arn,
+             r.name AS bucket_name,
+             'Bucket resource policy allows public access — review immediately' AS issue
+      ORDER BY r.name
+    recommendation: >
+      Enable S3 Block Public Access at the account level. Review any bucket with
+      a public policy. Use Amazon Macie to discover sensitive data in S3.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html"]
+
+  - id: CIS-AWS-2.2.1
+    title: "Ensure EBS Volume encryption is enabled in all regions"
+    severity: MEDIUM
+    description: >
+      CIS 2.2.1: Unencrypted EBS volumes expose data at rest if the physical
+      storage media is accessed. Default EBS encryption should be enabled
+      account-wide in every region.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'ec2:Instance'})
+      WHERE r.scan_start_ms >= $scan_start
+      RETURN r.arn AS instance_arn,
+             r.name AS instance_name,
+             r.region AS region,
+             'Verify attached EBS volumes are encrypted — check EC2 console' AS action
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Enable default EBS encryption per region: EC2 → Account Attributes →
+      EBS Encryption → Manage → Enable. Existing volumes must be re-encrypted
+      via snapshot copy.
+    mitre: ["T1005 - Data from Local System"]
+    references: ["https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EBSEncryption.html"]
+
+  # ── Section 3: Logging ───────────────────────────────────────────────────
+
+  - id: CIS-AWS-3.1
+    title: "Ensure CloudTrail is enabled in all regions"
+    severity: HIGH
+    description: >
+      CIS 3.1: CloudTrail records API calls across the AWS account. Without
+      multi-region CloudTrail, attacker activity in non-primary regions goes
+      unrecorded, making incident response impossible.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WITH count(p) AS total
+      WHERE total > 0
+        AND p.scan_start_ms >= $scan_start
+      RETURN total,
+             'Manual check: verify multi-region CloudTrail trail is active in CloudTrail console' AS action
+      LIMIT 1
+    recommendation: >
+      AWS Console → CloudTrail → Create Trail → enable "Apply trail to all regions".
+      Enable log file validation. Store logs in a dedicated S3 bucket with MFA Delete.
+    mitre: ["T1562.008 - Disable or Modify Cloud Logs"]
+    references: ["https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-create-and-update-a-trail.html"]
+
+  - id: CIS-AWS-3.2
+    title: "Ensure CloudTrail log file validation is enabled"
+    severity: MEDIUM
+    description: >
+      CIS 3.2: Log file validation creates digitally signed digest files that
+      let you detect if CloudTrail log files were modified, deleted, or forged
+      after delivery to S3.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WITH count(p) AS total
+      WHERE total > 0
+        AND p.scan_start_ms >= $scan_start
+      RETURN total,
+             'Manual check: verify CloudTrail log file validation is enabled (LogFileValidationEnabled: true)' AS action
+      LIMIT 1
+    recommendation: >
+      AWS CLI: aws cloudtrail update-trail --name <trail-name> --enable-log-file-validation
+    mitre: ["T1562.008 - Disable or Modify Cloud Logs"]
+    references: ["https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-log-file-validation-intro.html"]
+
+  - id: CIS-AWS-3.3
+    title: "Ensure AWS Config is enabled in all regions"
+    severity: MEDIUM
+    description: >
+      CIS 3.3: AWS Config provides continuous monitoring of resource configurations
+      and configuration changes. Without it, detecting resource drift and
+      compliance violations is manual and error-prone.
+    cypher: |
+      MATCH (r:AWSResource)
+      WITH count(r) AS total_resources
+      WHERE total_resources > 0
+        AND r.scan_start_ms >= $scan_start
+      RETURN total_resources,
+             'Manual check: verify AWS Config is enabled in all regions used — Config console' AS action
+      LIMIT 1
+    recommendation: >
+      Enable AWS Config in every region where you have resources.
+      Enable configuration history and snapshots. Set up a delivery channel
+      to S3 and optionally SNS for notifications.
+    mitre: ["T1562 - Impair Defenses"]
+    references: ["https://docs.aws.amazon.com/config/latest/developerguide/getting-started.html"]
+
+  - id: CIS-AWS-3.4
+    title: "Ensure S3 bucket access logging is enabled on the CloudTrail S3 bucket"
+    severity: LOW
+    description: >
+      CIS 3.4: S3 server access logs for the CloudTrail bucket provide visibility
+      into who accessed the audit logs themselves. This creates a meta-audit trail
+      for your security logs.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 's3:Bucket'})
+      WHERE r.name CONTAINS 'cloudtrail'
+        AND r.scan_start_ms >= $scan_start
+         OR r.name CONTAINS 'trail'
+         OR r.name CONTAINS 'audit'
+      RETURN r.arn AS bucket_arn,
+             r.name AS bucket_name,
+             'Verify S3 access logging is enabled on this CloudTrail bucket' AS action
+      LIMIT 10
+    recommendation: >
+      Enable S3 access logging on CloudTrail buckets. Create a separate
+      target bucket for the access logs (different from the CloudTrail bucket).
+    mitre: ["T1562.008 - Disable or Modify Cloud Logs"]
+    references: ["https://docs.aws.amazon.com/AmazonS3/latest/userguide/ServerLogs.html"]
+
+  # ── Section 4: Monitoring ────────────────────────────────────────────────
+
+  - id: CIS-AWS-4.1
+    title: "Ensure log metric filter and alarm exists for unauthorized API calls"
+    severity: HIGH
+    description: >
+      CIS 4.1: Real-time alerts on unauthorized API calls (AccessDenied events)
+      can detect attacker reconnaissance and credential abuse early.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WITH count(p) AS total
+      WHERE total > 0
+        AND p.scan_start_ms >= $scan_start
+      RETURN total,
+             'Manual check: verify CloudWatch alarm exists for unauthorized API calls via CloudTrail metric filter' AS action
+      LIMIT 1
+    recommendation: >
+      Create CloudWatch metric filter on CloudTrail logs for
+      errorCode=AccessDenied or errorCode=UnauthorizedOperation.
+      Set alarm threshold at 1 occurrence to page on-call immediately.
+    mitre: ["T1078 - Valid Accounts"]
+    references: ["https://docs.aws.amazon.com/securityhub/latest/userguide/cloudwatch-controls.html"]
+
+  - id: CIS-AWS-4.2
+    title: "Ensure log metric filter and alarm exists for AWS Management Console sign-in without MFA"
+    severity: HIGH
+    description: >
+      CIS 4.2: Console sign-ins without MFA indicate either a user who bypassed
+      MFA or an attacker who obtained a valid password. Both warrant immediate investigation.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WITH count(p) AS total
+      WHERE total > 0
+        AND p.scan_start_ms >= $scan_start
+      RETURN total,
+             'Manual check: CloudWatch alarm for console sign-ins without MFA (ConsoleLogin + MFAUsed=No)' AS action
+      LIMIT 1
+    recommendation: >
+      Create a metric filter on CloudTrail for: eventName=ConsoleLogin AND
+      additionalEventData.MFAUsed=No. Set CloudWatch alarm threshold = 1.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://docs.aws.amazon.com/securityhub/latest/userguide/cloudwatch-controls.html"]
+
+  - id: CIS-AWS-4.3
+    title: "Ensure log metric filter and alarm exists for usage of root account"
+    severity: CRITICAL
+    description: >
+      CIS 4.3: Any usage of the root account outside of initial setup or
+      break-glass scenarios is abnormal and should trigger an immediate alert.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE p.name = 'root'
+        AND p.scan_start_ms >= $scan_start
+      RETURN p.arn AS root_arn,
+             'Manual check: CloudWatch alarm for root usage — any ConsoleLogin or API call by root' AS action
+    recommendation: >
+      Create metric filter for: userIdentity.type=Root AND eventType=AwsApiCall
+      OR eventName=ConsoleLogin. Set alarm threshold = 1. This should never fire.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://docs.aws.amazon.com/securityhub/latest/userguide/cloudwatch-controls.html"]
+
+  - id: CIS-AWS-4.4
+    title: "Ensure log metric filter and alarm exists for IAM policy changes"
+    severity: MEDIUM
+    description: >
+      CIS 4.4: Real-time alerts on IAM policy changes help detect privilege
+      escalation attempts. Attackers often modify IAM policies to maintain
+      persistence or escalate their access.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WITH count(p) AS total
+      WHERE total > 0
+        AND p.scan_start_ms >= $scan_start
+      RETURN total,
+             'Manual check: CloudWatch alarm for IAM changes (CreatePolicy, AttachRolePolicy, etc.)' AS action
+      LIMIT 1
+    recommendation: >
+      Create metric filter for IAM API calls: CreatePolicy|DeletePolicy|
+      AttachRolePolicy|DetachRolePolicy|PutRolePolicy|DeleteRolePolicy.
+      Set CloudWatch alarm threshold = 1.
+    mitre: ["T1484 - Domain Policy Modification"]
+    references: ["https://docs.aws.amazon.com/securityhub/latest/userguide/cloudwatch-controls.html"]
+
+  - id: CIS-AWS-4.5
+    title: "Ensure log metric filter and alarm exists for CloudTrail configuration changes"
+    severity: HIGH
+    description: >
+      CIS 4.5: Attackers who gain admin access often try to disable CloudTrail
+      to eliminate evidence of their activity. Alert on any CloudTrail changes.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WITH count(p) AS total
+      WHERE total > 0
+        AND p.scan_start_ms >= $scan_start
+      RETURN total,
+             'Manual check: CloudWatch alarm for CloudTrail changes (StopLogging, DeleteTrail, UpdateTrail)' AS action
+      LIMIT 1
+    recommendation: >
+      Create metric filter for: eventName=CreateTrail|UpdateTrail|DeleteTrail|
+      StartLogging|StopLogging. Set alarm threshold = 1.
+    mitre: ["T1562.008 - Disable or Modify Cloud Logs"]
+    references: ["https://docs.aws.amazon.com/securityhub/latest/userguide/cloudwatch-controls.html"]
+
+  # ── Section 5: Networking ────────────────────────────────────────────────
+
+  - id: CIS-AWS-5.1
+    title: "Ensure no Network ACLs allow ingress from 0.0.0.0/0 to remote server administration ports"
+    severity: HIGH
+    description: >
+      CIS 5.1: Network ACLs allowing unrestricted inbound access to SSH (22)
+      or RDP (3389) expose instances to brute force and exploitation.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'ec2:Instance'})
+      WHERE r.scan_start_ms >= $scan_start
+      RETURN r.arn AS instance_arn,
+             r.name AS instance_name,
+             r.region AS region,
+             'Manual check: review Security Groups and NACLs for 0.0.0.0/0 on port 22 or 3389' AS action
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Remove any NACL or security group rule allowing 0.0.0.0/0 on ports 22 or 3389.
+      Use AWS Systems Manager Session Manager instead of direct SSH/RDP.
+    mitre: ["T1021.001 - Remote Desktop Protocol", "T1021.004 - SSH"]
+    references: ["https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html"]
+
+  - id: CIS-AWS-5.2
+    title: "Ensure no security groups allow ingress from 0.0.0.0/0 to port 22"
+    severity: HIGH
+    description: >
+      CIS 5.2: Security groups with unrestricted SSH access (port 22 from 0.0.0.0/0)
+      expose EC2 instances to brute force attacks from the entire internet.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'ec2:Instance'})
+      WHERE r.scan_start_ms >= $scan_start
+      RETURN r.arn AS instance_arn,
+             r.name AS instance_name,
+             r.region AS region,
+             'Check attached security groups — port 22 from 0.0.0.0/0 is a critical exposure' AS action
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Remove 0.0.0.0/0 from port 22 in all security groups. Use SSM Session Manager
+      for interactive access. If SSH is required, restrict to specific IP ranges.
+    mitre: ["T1021.004 - SSH"]
+    references: ["https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/authorizing-access-to-an-instance.html"]
+
+  - id: CIS-AWS-5.3
+    title: "Ensure no security groups allow ingress from 0.0.0.0/0 to port 3389"
+    severity: HIGH
+    description: >
+      CIS 5.3: Security groups with unrestricted RDP access (port 3389 from 0.0.0.0/0)
+      expose Windows instances to brute force and exploitation of RDP vulnerabilities.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'ec2:Instance'})
+      WHERE r.scan_start_ms >= $scan_start
+      RETURN r.arn AS instance_arn,
+             r.name AS instance_name,
+             r.region AS region,
+             'Check attached security groups — port 3389 from 0.0.0.0/0 is critical RDP exposure' AS action
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Remove 0.0.0.0/0 from port 3389. Use AWS Systems Manager Fleet Manager
+      for remote desktop access without opening port 3389.
+    mitre: ["T1021.001 - Remote Desktop Protocol"]
+    references: ["https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/authorizing-access-to-an-instance.html"]
+
+  - id: CIS-AWS-5.4
+    title: "Ensure routing tables for VPC peering are 'least access'"
+    severity: LOW
+    description: >
+      CIS 5.4: VPC peering connections should route only the minimum required
+      CIDR ranges, not blanket 0.0.0.0/0. Over-broad routes in peered VPCs
+      create lateral movement paths for attackers.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WITH count(p) AS total
+      WHERE total > 0
+        AND p.scan_start_ms >= $scan_start
+      RETURN total,
+             'Manual check: review VPC peering route tables for overly broad routes (0.0.0.0/0)' AS action
+      LIMIT 1
+    recommendation: >
+      Review all VPC peering connection route tables. Replace 0.0.0.0/0 with
+      the specific CIDR of the destination VPC. Apply least privilege to routing.
+    mitre: ["T1599 - Network Boundary Bridging"]
+    references: ["https://docs.aws.amazon.com/vpc/latest/peering/peering-configurations-partial-access.html"]
+
+  # ── Additional IAM checks from AWS Security Hub ──────────────────────────
+
+  - id: CIS-AWS-IAM.21
+    title: "IAM customer managed policies should not allow wildcard actions for services"
+    severity: HIGH
+    description: >
+      Inline policies with wildcard actions (iam:*, s3:*, ec2:*) grant all
+      permissions for an AWS service rather than the minimum required.
+      This violates least privilege and enables privilege escalation.
+    cypher: |
+      MATCH (p:AWSPrincipal)
+      WHERE p.inline_policies CONTAINS ':*"'
+        AND p.scan_start_ms >= $scan_start
+         OR p.attached_policies CONTAINS ':*"'
+      RETURN p.arn AS principal_arn,
+             p.name AS name,
+             p.principal_type AS type,
+             'Principal has wildcard service-level actions in policies — review for least privilege' AS issue
+      ORDER BY p.principal_type, p.name
+    recommendation: >
+      Replace service wildcard actions (s3:*, iam:*) with explicit action lists.
+      Use IAM Access Analyzer policy generation to create least-privilege policies
+      based on actual CloudTrail usage.
+    mitre: ["T1078.004 - Cloud Accounts", "T1548 - Abuse Elevation Control Mechanism"]
+    references: ["https://docs.aws.amazon.com/securityhub/latest/userguide/iam-controls.html"]
+
+  - id: CIS-AWS-IAM.22
+    title: "IAM user credentials unused for 45 days should be removed"
+    severity: MEDIUM
+    description: >
+      AWS Security Hub IAM.22: Dormant credentials represent unnecessary
+      attack surface. Any IAM credential not used in 45 days should be
+      reviewed and disabled.
+    cypher: |
+      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      WHERE NOT p.name = 'root'
+        AND p.scan_start_ms >= $scan_start
+      RETURN p.arn AS user_arn,
+             p.name AS username,
+             p.metadata AS metadata,
+             'Check credential report for unused credentials >45 days and disable them' AS action
+      ORDER BY p.name
+      LIMIT 100
+    recommendation: >
+      Use AWS Config rule iam-user-unused-credentials-check to automatically
+      detect and alert on users with unused credentials.
+    mitre: ["T1078.004 - Cloud Accounts"]
+    references: ["https://docs.aws.amazon.com/securityhub/latest/userguide/iam-controls.html"]

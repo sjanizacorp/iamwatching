@@ -1,0 +1,492 @@
+# AWS Data Plane — Storage, Database, Analytics, Streaming, Caching Security Checks
+# IamWatching v2.0 | Aniza Corp
+
+framework: AWS-DATA-SECURITY
+description: >
+  Security checks for AWS data plane services:
+  S3, RDS, Aurora, DynamoDB, Redshift, ElastiCache, Kinesis, EBS, EFS.
+
+checks:
+
+  # ── RDS / Aurora ──────────────────────────────────────────────────────────
+
+  - id: AWS-RDS-001
+    title: "RDS instances should not be publicly accessible"
+    severity: CRITICAL
+    description: >
+      A publicly accessible RDS instance exposes the database port to the
+      internet. Even with strong passwords, this dramatically increases attack
+      surface for brute force, credential stuffing, and exploitation of
+      database engine vulnerabilities.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'rds:DBInstance'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS instance_arn,
+             r.name AS instance_name,
+             r.region AS region,
+             r.account_id AS account_id,
+             r.metadata AS metadata,
+             'RDS instance is publicly accessible — set PubliclyAccessible=false' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Set PubliclyAccessible=false on all RDS instances. Place databases in
+      private VPC subnets. Use bastion hosts, VPN, or SSM Port Forwarding for
+      administrative access.
+    mitre: ["T1190 - Exploit Public-Facing Application", "T1133 - External Remote Services"]
+    references: ["https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_VPC.WorkingWithRDSInstanceinaVPC.html"]
+
+  - id: AWS-RDS-002
+    title: "RDS instances should have encryption at rest enabled"
+    severity: HIGH
+    description: >
+      Unencrypted RDS volumes expose data if the underlying storage is
+      physically accessed or if snapshots are shared. Encryption must be
+      enabled at creation time and cannot be added to existing instances
+      without a migration.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'rds:DBInstance'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS instance_arn,
+             r.name AS instance_name,
+             r.region AS region,
+             r.metadata AS metadata,
+             'RDS instance not encrypted at rest — enable encryption (requires recreation)' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Encrypt new instances with a customer-managed KMS key. For existing
+      unencrypted instances: take a snapshot, copy it with encryption enabled,
+      restore from the encrypted snapshot.
+    mitre: ["T1005 - Data from Local System"]
+    references: ["https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Overview.Encryption.html"]
+
+  - id: AWS-RDS-003
+    title: "RDS instances should have automated backups enabled"
+    severity: HIGH
+    description: >
+      Automated backups with a retention period provide point-in-time recovery
+      capability. Without backups, a ransomware attack, accidental deletion, or
+      corruption leaves no recovery path.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'rds:DBInstance'})
+      WHERE r.backup_enabled = false OR r.backup_enabled IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS instance_arn,
+             r.name AS instance_name,
+             r.region AS region,
+             'RDS instance has no automated backups — enable with minimum 7-day retention' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Set BackupRetentionPeriod to at least 7 days for production databases,
+      35 days for compliance-sensitive workloads. Enable automated backups
+      in the preferred maintenance window.
+    mitre: ["T1485 - Data Destruction"]
+    references: ["https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_WorkingWithAutomatedBackups.html"]
+
+  - id: AWS-RDS-004
+    title: "RDS instances should have deletion protection enabled"
+    severity: MEDIUM
+    description: >
+      Without deletion protection, any IAM principal with rds:DeleteDBInstance
+      permission can permanently delete the database. Deletion protection
+      requires an explicit API call to disable before deletion.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'rds:DBInstance'})
+      WHERE r.deletion_protection = false OR r.deletion_protection IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS instance_arn,
+             r.name AS instance_name,
+             r.region AS region,
+             'RDS instance has no deletion protection — enable to prevent accidental deletion' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable DeletionProtection on all production databases. This does not
+      prevent snapshots or data access — only the DeleteDBInstance API call.
+    mitre: ["T1485 - Data Destruction"]
+    references: ["https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_DeleteInstance.html"]
+
+  - id: AWS-RDS-005
+    title: "RDS instances should enable IAM database authentication"
+    severity: MEDIUM
+    description: >
+      IAM database authentication lets applications authenticate using temporary
+      IAM tokens instead of long-lived database passwords. This eliminates
+      stored database credentials and integrates with CloudTrail for auth logging.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'rds:DBInstance'})
+      WHERE NOT r.metadata CONTAINS '"iam_auth": true'
+        AND r.scan_start_ms >= $scan_start
+        AND (r.metadata CONTAINS '"engine": "mysql"'
+          OR r.metadata CONTAINS '"engine": "postgres"')
+      RETURN r.arn AS instance_arn,
+             r.name AS instance_name,
+             r.region AS region,
+             r.metadata AS metadata,
+             'RDS MySQL/PostgreSQL instance does not use IAM authentication — enable for token-based auth' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable IAM database authentication on MySQL and PostgreSQL instances.
+      Create IAM policies granting rds-db:connect. Update applications to
+      generate and use temporary tokens.
+    mitre: ["T1078 - Valid Accounts"]
+    references: ["https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.IAMDBAuth.html"]
+
+  - id: AWS-RDS-006
+    title: "RDS instances should be Multi-AZ for high availability"
+    severity: MEDIUM
+    description: >
+      Single-AZ RDS instances have no automatic failover. An AZ outage, hardware
+      failure, or maintenance event causes downtime. Multi-AZ provides synchronous
+      replication and automatic failover within 60-120 seconds.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'rds:DBInstance'})
+      WHERE r.multi_az = false OR r.multi_az IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS instance_arn,
+             r.name AS instance_name,
+             r.region AS region,
+             'RDS instance is Single-AZ — enable Multi-AZ for production resilience' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Enable Multi-AZ on production databases. Consider Amazon Aurora Global
+      Database for cross-region resilience. Single-AZ is acceptable for dev/test.
+    mitre: []
+    references: ["https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZSingleStandby.html"]
+
+  - id: AWS-RDS-007
+    title: "RDS enhanced monitoring and Performance Insights should be enabled"
+    severity: LOW
+    description: >
+      Without enhanced monitoring, RDS provides only basic CloudWatch metrics.
+      Enhanced monitoring provides OS-level metrics and Performance Insights
+      shows SQL-level query activity useful for detecting anomalous database access.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'rds:DBInstance'})
+      WHERE NOT r.metadata CONTAINS '"monitoring_interval": 0'
+        AND r.scan_start_ms >= $scan_start
+         AND NOT r.metadata CONTAINS '"performance_insights": true'
+      RETURN r.arn AS instance_arn,
+             r.name AS instance_name,
+             r.region AS region,
+             'Enable Enhanced Monitoring and Performance Insights for observability' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 50
+    recommendation: >
+      Set MonitoringInterval to 30 or 60 seconds. Enable Performance Insights
+      with 7-day free retention (731 days for compliance). Costs are minimal.
+    mitre: []
+    references: ["https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_Monitoring.OS.html"]
+
+  # ── DynamoDB ──────────────────────────────────────────────────────────────
+
+  - id: AWS-DDB-001
+    title: "DynamoDB tables should be encrypted with customer-managed KMS keys"
+    severity: MEDIUM
+    description: >
+      DynamoDB tables are encrypted by default with AWS-owned keys. For sensitive
+      data, customer-managed KMS keys provide key usage auditing via CloudTrail
+      and allow key rotation and independent access control.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'dynamodb:Table'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS table_arn,
+             r.name AS table_name,
+             r.region AS region,
+             r.account_id AS account_id,
+             'DynamoDB table uses AWS-owned key — upgrade to customer-managed KMS key' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Update the SSESpecification to use SSEType=KMS with a customer KmsMasterKeyId.
+      This can be done on existing tables without downtime.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/EncryptionAtRest.html"]
+
+  - id: AWS-DDB-002
+    title: "DynamoDB tables should have Point-in-Time Recovery enabled"
+    severity: HIGH
+    description: >
+      Without PITR, DynamoDB data can only be restored from on-demand backups
+      which must be explicitly taken. PITR provides continuous backups with
+      35-day recovery window, protecting against accidental deletion and corruption.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'dynamodb:Table'})
+      WHERE r.backup_enabled = false OR r.backup_enabled IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS table_arn,
+             r.name AS table_name,
+             r.region AS region,
+             'DynamoDB PITR is disabled — enable for 35-day point-in-time recovery' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable PITR on all production DynamoDB tables. There is no performance
+      impact. Cost is approximately 0.20/GB-month for data stored in backups.
+    mitre: ["T1485 - Data Destruction"]
+    references: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/PointInTimeRecovery.html"]
+
+  - id: AWS-DDB-003
+    title: "DynamoDB tables should have deletion protection enabled"
+    severity: MEDIUM
+    description: >
+      Without deletion protection, the DeleteTable API can permanently destroy
+      a table and all its data. This can happen via misconfigured IaC, runaway
+      automation scripts, or attacker actions.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'dynamodb:Table'})
+      WHERE NOT r.metadata CONTAINS '"deletion_protection": true'
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS table_arn,
+             r.name AS table_name,
+             r.region AS region,
+             'DynamoDB table has no deletion protection — enable DeletionProtectionEnabled' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable DeletionProtectionEnabled on all production tables via the console
+      or CLI: aws dynamodb update-table --deletion-protection-enabled
+    mitre: ["T1485 - Data Destruction"]
+    references: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/WorkingWithTables.Basics.html"]
+
+  # ── Redshift ──────────────────────────────────────────────────────────────
+
+  - id: AWS-RS-001
+    title: "Redshift clusters should not be publicly accessible"
+    severity: CRITICAL
+    description: >
+      Publicly accessible Redshift clusters expose the data warehouse port (5439)
+      to the internet, enabling direct brute-force attacks and exploitation of
+      PostgreSQL-based vulnerabilities at massive scale.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'redshift:Cluster'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS cluster_arn,
+             r.name AS cluster_name,
+             r.region AS region,
+             r.account_id AS account_id,
+             'Redshift cluster is publicly accessible — disable PubliclyAccessible' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Disable PubliclyAccessible on all Redshift clusters. Access from BI tools
+      should use VPN, Direct Connect, or SSH tunnels through a bastion host.
+    mitre: ["T1190 - Exploit Public-Facing Application"]
+    references: ["https://docs.aws.amazon.com/redshift/latest/mgmt/working-with-clusters.html"]
+
+  - id: AWS-RS-002
+    title: "Redshift clusters should have encryption enabled"
+    severity: HIGH
+    description: >
+      Unencrypted Redshift clusters expose data warehouse contents on disk.
+      For data warehouses containing PII, financial records, or regulated data,
+      encryption is a compliance requirement (GDPR, PCI DSS, HIPAA).
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'redshift:Cluster'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS cluster_arn,
+             r.name AS cluster_name,
+             r.region AS region,
+             'Redshift cluster is not encrypted — enable encryption (requires restore)' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable encryption with a customer-managed KMS key. Existing clusters
+      require snapshot → encrypted restore. New clusters set Encrypted=true.
+    mitre: ["T1005 - Data from Local System"]
+    references: ["https://docs.aws.amazon.com/redshift/latest/mgmt/working-with-db-encryption.html"]
+
+  - id: AWS-RS-003
+    title: "Redshift should have audit logging enabled"
+    severity: HIGH
+    description: >
+      Redshift audit logging captures connection attempts, authentication events,
+      and user activity. Without it, detecting unauthorized access, data exfiltration,
+      or credential compromise in the data warehouse is impossible.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'redshift:Cluster'})
+      WHERE r.logging_enabled = false OR r.logging_enabled IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS cluster_arn,
+             r.name AS cluster_name,
+             r.region AS region,
+             'Redshift audit logging disabled — enable to S3 bucket for compliance' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable audit logging to a dedicated S3 bucket. Log types: connectionlog,
+      useractivitylog, userlog. Enable enhanced VPC routing for network-level isolation.
+    mitre: ["T1562.008 - Disable or Modify Cloud Logs"]
+    references: ["https://docs.aws.amazon.com/redshift/latest/mgmt/db-auditing.html"]
+
+  # ── ElastiCache ───────────────────────────────────────────────────────────
+
+  - id: AWS-EC-001
+    title: "ElastiCache clusters should have encryption in transit enabled"
+    severity: HIGH
+    description: >
+      ElastiCache Redis clusters without in-transit encryption send all cache
+      data, including session tokens and credentials, in plaintext. Any host
+      on the network path can read this traffic.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'elasticache:Cluster'})
+      WHERE NOT r.metadata CONTAINS '"transit_encryption": true'
+        AND r.scan_start_ms >= $scan_start
+        AND r.metadata CONTAINS '"engine": "redis"'
+      RETURN r.arn AS cluster_arn,
+             r.name AS cluster_name,
+             r.region AS region,
+             r.metadata AS metadata,
+             'ElastiCache Redis cluster has no in-transit encryption — enable TLS' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable TransitEncryptionEnabled=true when creating the cluster (cannot be
+      added post-creation). Migrate existing clusters by creating a new encrypted
+      cluster and repointing applications.
+    mitre: ["T1557 - Adversary-in-the-Middle"]
+    references: ["https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/in-transit-encryption.html"]
+
+  - id: AWS-EC-002
+    title: "ElastiCache Redis clusters should require AUTH token"
+    severity: HIGH
+    description: >
+      ElastiCache Redis without an AUTH token allows any client with network
+      access to execute Redis commands including FLUSHALL (delete all data),
+      CONFIG SET, and even server-side scripting via Lua.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'elasticache:Cluster'})
+      WHERE r.auth_type = 'none'
+        AND r.scan_start_ms >= $scan_start
+        AND r.metadata CONTAINS '"engine": "redis"'
+      RETURN r.arn AS cluster_arn,
+             r.name AS cluster_name,
+             r.region AS region,
+             'ElastiCache Redis has no AUTH token — enable for authentication' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable AuthToken on Redis clusters. For Serverless, use IAM authentication.
+      Rotate the auth token quarterly. Store in Secrets Manager.
+    mitre: ["T1078 - Valid Accounts", "T1485 - Data Destruction"]
+    references: ["https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/auth.html"]
+
+  - id: AWS-EC-003
+    title: "ElastiCache clusters should have encryption at rest enabled"
+    severity: MEDIUM
+    description: >
+      ElastiCache Redis clusters store cached data on disk during persistence
+      operations. Without at-rest encryption, this data is recoverable if
+      underlying storage media is accessed.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'elasticache:Cluster'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS cluster_arn,
+             r.name AS cluster_name,
+             r.region AS region,
+             'ElastiCache cluster has no at-rest encryption — enable AtRestEncryptionEnabled' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Set AtRestEncryptionEnabled=true when creating the cluster.
+      For existing clusters, create a new encrypted cluster and migrate data.
+    mitre: ["T1005 - Data from Local System"]
+    references: ["https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/at-rest-encryption.html"]
+
+  # ── Kinesis ───────────────────────────────────────────────────────────────
+
+  - id: AWS-KIN-001
+    title: "Kinesis Data Streams should be encrypted with KMS"
+    severity: HIGH
+    description: >
+      Kinesis Data Streams without server-side encryption store streaming data
+      in plaintext. For streams carrying PII, payment data, logs, or security
+      events, KMS encryption is required by most compliance frameworks.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'kinesis:Stream'})
+      WHERE r.encrypted = false OR r.encrypted IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS stream_arn,
+             r.name AS stream_name,
+             r.region AS region,
+             r.account_id AS account_id,
+             'Kinesis stream is not encrypted — enable KMS server-side encryption' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable server-side encryption with EncryptionType=KMS and specify
+      a customer-managed KMS key. Existing streams can be encrypted without
+      downtime via update-shard-count or by enabling SSE directly.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://docs.aws.amazon.com/streams/latest/dev/server-side-encryption.html"]
+
+  - id: AWS-KIN-002
+    title: "Kinesis streams should have extended data retention"
+    severity: LOW
+    description: >
+      The default Kinesis retention period is 24 hours. With 24-hour retention,
+      a security incident discovered after 24 hours has no stream data to
+      investigate. Extended retention (up to 365 days) is critical for forensics.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 'kinesis:Stream'})
+      WHERE r.metadata CONTAINS '"retention_hours"'
+        AND r.scan_start_ms >= $scan_start
+        AND NOT r.metadata CONTAINS '"retention_hours": 168'
+        AND NOT r.metadata CONTAINS '"retention_hours": 720'
+        AND NOT r.metadata CONTAINS '"retention_hours": 8760'
+      RETURN r.arn AS stream_arn,
+             r.name AS stream_name,
+             r.region AS region,
+             r.metadata AS metadata,
+             'Kinesis stream may have short retention — extend to 7+ days for security investigations' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Increase retention period to at least 7 days (168 hours) for production
+      streams. Use Kinesis Firehose to archive data to S3 for long-term retention.
+    mitre: ["T1562.008 - Disable or Modify Cloud Logs"]
+    references: ["https://docs.aws.amazon.com/streams/latest/dev/kinesis-extended-retention.html"]
+
+  # ── S3 Advanced ───────────────────────────────────────────────────────────
+
+  - id: AWS-S3-001
+    title: "S3 buckets should have versioning enabled"
+    severity: MEDIUM
+    description: >
+      S3 versioning protects against accidental deletion and ransomware attacks
+      that overwrite objects. Without versioning, a single DeleteObject or
+      PutObject call can permanently destroy or replace data.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 's3:Bucket'})
+      WHERE r.versioning_enabled = false OR r.versioning_enabled IS NULL
+        AND r.scan_start_ms >= $scan_start
+      RETURN r.arn AS bucket_arn,
+             r.name AS bucket_name,
+             r.region AS region,
+             'S3 bucket has no versioning — enable to protect against deletion/overwrite' AS issue
+      ORDER BY r.region, r.name
+      LIMIT 100
+    recommendation: >
+      Enable versioning on all buckets storing important data. Combine with
+      S3 Object Lock for WORM protection on compliance data. Set lifecycle
+      rules to expire old versions after 90+ days.
+    mitre: ["T1485 - Data Destruction"]
+    references: ["https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html"]
+
+  - id: AWS-S3-002
+    title: "S3 buckets should block all public access"
+    severity: CRITICAL
+    description: >
+      S3 public access block settings prevent future bucket or object policies
+      from accidentally making data public. Over 90% of cloud data breaches
+      involve publicly accessible S3 buckets.
+    cypher: |
+      MATCH (r:AWSResource {resource_type: 's3:Bucket'})
+      WHERE r.public_access = true
+        AND r.scan_start_ms >= $scan_start
+         OR r.resource_policy CONTAINS '"Principal": "*"'
+         OR r.resource_policy CONTAINS '"Principal":"*"'
+      RETURN r.arn AS bucket_arn,
+             r.name AS bucket_name,
+             r.region AS region,
+             'S3 bucket is publicly accessible — enable Block Public Access settings' AS issue
+      ORDER BY r.region, r.name
+    recommendation: >
+      Enable all four S3 Block Public Access settings at both account and bucket
+      level: BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy, RestrictPublicBuckets.
+    mitre: ["T1530 - Data from Cloud Storage"]
+    references: ["https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html"]
