@@ -209,14 +209,15 @@ def audit(
 # CROSS-CLOUD and CUSTOM are the only truly cloud-agnostic frameworks.
 # Their queries use generic Resource/Principal labels AND filter by
 # updated_at >= scan_start so they only surface nodes from the current scan.
-_AWS_FRAMEWORK_PREFIXES   = [
-    "CIS-AWS", "AWS-COMPUTE", "AWS-DATA",
-    # Compliance frameworks: all current checks query AWSPrincipal/AWSResource
-    "NIST", "OWASP", "PCI", "ISO",
-]
+# AWS-specific frameworks — only run when --aws is active
+_AWS_FRAMEWORK_PREFIXES   = ["CIS-AWS", "AWS-COMPUTE", "AWS-DATA"]
 _AZURE_FRAMEWORK_PREFIXES = ["AZURE"]
 _GCP_FRAMEWORK_PREFIXES   = ["GCP"]
-_ALWAYS_RUN_PREFIXES      = ["CROSS-CLOUD", "CUSTOM"]
+# These compliance frameworks run on EVERY cloud scan.
+# Their Cypher queries use generic Principal/Resource labels (not AWSPrincipal)
+# so they surface findings from whichever cloud was just scanned.
+# scan_start_ms scoping ensures only current-scan nodes appear.
+_ALWAYS_RUN_PREFIXES      = ["CROSS-CLOUD", "CUSTOM", "NIST", "OWASP", "PCI", "ISO"]
 
 
 def _resolve_family_filter(family_args: tuple) -> list[str]:
@@ -567,10 +568,20 @@ async def _run_audit(
                 matcher = PatternMatcher(**neo4j_cfg)
                 await matcher.connect()
                 sev_enum = Severity(severity_filter) if severity_filter else None
+                # active_clouds passed explicitly — never derived from framework names
+                # so NIST/OWASP/PCI/ISO in the always-run list don't incorrectly
+                # activate AWS hardcoded rules during Azure or GCP scans.
+                _clouds: set[str] = set()
+                if do_aws:   _clouds.add("aws")
+                if do_azure: _clouds.add("azure")
+                if do_gcp:   _clouds.add("gcp")
+                if not _clouds: _clouds = {"aws"}  # fallback matches audit default
+
                 findings = await matcher.run_all(
                     severity_filter=sev_enum,
                     frameworks=family_filter,
                     scan_start_ms=scan_start_ms,
+                    active_clouds=_clouds,
                 )
                 await matcher.close()
                 report["findings"] = [
@@ -913,13 +924,15 @@ def checks_reload():
 @click.option("--title", required=True, help="Short descriptive title")
 @click.option("--severity", default="MEDIUM",
               type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]))
-@click.option("--cypher", required=True, help="Cypher query string")
+@click.option("--cypher", required=True, help="Neo4j Cypher query that returns affected resources")
 @click.option("--description", default="", help="What this check detects")
 @click.option("--recommendation", default="", help="How to fix findings")
-@click.option("--framework", default="CUSTOM", help="Framework name")
-def checks_add(check_id, title, severity, cypher, description, recommendation, framework):
+@click.option("--framework", default="CUSTOM", help="Framework name (default: CUSTOM)")
+@click.option("--mitre", default="", help="Comma-separated MITRE ATT&CK technique IDs")
+@click.option("--reference", default="", multiple=True, help="Reference URL (repeatable)")
+def checks_add(check_id, title, severity, cypher, description, recommendation, framework, mitre, reference):
     """
-    Add a custom check and save it to checks/custom/.
+    Write a new custom check and save it to checks/custom/.
 
     \b
     Example:
@@ -927,70 +940,466 @@ def checks_add(check_id, title, severity, cypher, description, recommendation, f
         --id CUSTOM-010 \\
         --title "Roles without description" \\
         --severity LOW \\
-        --cypher "MATCH (r:AWSPrincipal {principal_type:\'Role\'}) WHERE NOT r.metadata CONTAINS \'description\' RETURN r.arn" \\
-        --recommendation "Add descriptions to all IAM roles for auditability"
+        --cypher "MATCH (p:Principal {principal_type:\'Role\'}) WHERE p.scan_start_ms >= $scan_start AND NOT p.metadata CONTAINS \'description\' RETURN labels(p) AS cloud, p.name AS name" \\
+        --recommendation "Add descriptions to all roles for auditability"
+    """
+    from iamwatching.patterns.registry import get_registry  # noqa: PLC0415
+
+    registry = get_registry()
+    registry.load()
+
+    mitre_list = [m.strip() for m in mitre.split(",") if m.strip()] if mitre else []
+    check_def = {
+        "id": check_id,
+        "title": title,
+        "severity": severity,
+        "description": description,
+        "cypher": cypher,
+        "recommendation": recommendation,
+        "framework": framework,
+        "mitre": mitre_list,
+        "references": list(reference),
+    }
+    check = registry.add_custom(check_def, persist=True)
+    console.print(Panel(
+        f"[green]Check {check.id} saved[/green]\n\n"
+        f"Title:     {check.title}\n"
+        f"Severity:  {check.severity.value if hasattr(check.severity,'value') else check.severity}\n"
+        f"Framework: {check.framework}\n"
+        f"File:      checks/custom/{check_id.lower().replace('-','_')}.yaml\n\n"
+        "[dim]Run: iamwatching checks reload  to pick it up immediately.[/dim]",
+        title="[bold green]Custom Check Created[/bold green]",
+        border_style="green",
+    ))
+
+
+@checks.command("edit")
+@click.argument("check_id")
+@click.option("--title", default=None, help="New title")
+@click.option("--severity", default=None,
+              type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]))
+@click.option("--cypher", default=None, help="New Cypher query")
+@click.option("--description", default=None, help="New description")
+@click.option("--recommendation", default=None, help="New recommendation")
+def checks_edit(check_id, title, severity, cypher, description, recommendation):
+    """Edit a custom check. Built-in checks cannot be edited (use disable instead)."""
+    from iamwatching.patterns.registry import get_registry  # noqa: PLC0415
+
+    registry = get_registry()
+    registry.load()
+    check = registry.get(check_id)
+    if not check:
+        console.print(f"[red]Check {check_id} not found.[/red]")
+        return
+    if "custom" not in check.source_file and check.source_file != "runtime":
+        console.print(
+            Panel(
+                f"[yellow]{check_id} is a built-in check and cannot be edited.[/yellow]\n\n"
+                "To customise a built-in check:\n"
+                "  1. Export it:  [cyan]iamwatching checks export --id {check_id} --output my_check.yaml[/cyan]\n"
+                "  2. Edit the YAML file\n"
+                "  3. Import it:  [cyan]iamwatching checks import my_check.yaml[/cyan]\n"
+                "     (custom version overrides the built-in with the same ID)",
+                title="Built-in Check",
+                border_style="yellow",
+            )
+        )
+        return
+
+    if title:         check.title = title
+    if severity:      check.severity = check.severity.__class__(severity)
+    if cypher:        check.cypher = cypher
+    if description:   check.description = description
+    if recommendation: check.recommendation = recommendation
+
+    # Re-save to disk
+    import yaml as _yaml  # noqa: PLC0415
+    from pathlib import Path as _Path  # noqa: PLC0415
+    src = _Path(check.source_file)
+    if src.exists():
+        data = _yaml.safe_load(src.read_text())
+        for i, c in enumerate(data.get("checks", [])):
+            if c["id"] == check_id:
+                data["checks"][i] = check.to_dict()
+                break
+        src.write_text(_yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False))
+        console.print(f"[green]Check {check_id} updated in {src}[/green]")
+    else:
+        console.print(f"[yellow]Check updated in memory only (source file not found: {check.source_file})[/yellow]")
+
+
+@checks.command("delete")
+@click.argument("check_id")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt")
+def checks_delete(check_id, yes):
+    """Permanently delete a custom check. Built-in checks cannot be deleted."""
+    from iamwatching.patterns.registry import get_registry  # noqa: PLC0415
+
+    registry = get_registry()
+    registry.load()
+    check = registry.get(check_id)
+    if not check:
+        console.print(f"[red]Check {check_id} not found.[/red]")
+        return
+    if not yes:
+        click.confirm(f"Permanently delete {check_id} ({check.title})?", abort=True)
+    try:
+        registry.delete_custom(check_id)
+        console.print(f"[green]Deleted: {check_id}[/green]")
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        console.print("[dim]Tip: to suppress a built-in check, use: iamwatching checks disable {check_id}[/dim]")
+
+
+@checks.command("export")
+@click.option("--output", "-o", required=True, help="Output file path (.yaml or .json)")
+@click.option("--framework", default=None, help="Filter by framework (e.g. NIST, CIS, CUSTOM)")
+@click.option("--custom-only", is_flag=True, help="Export only custom checks")
+@click.option("--enabled-only", is_flag=True, help="Export only enabled checks")
+@click.option("--id", "check_id", default=None, help="Export a single check by ID")
+def checks_export(output, framework, custom_only, enabled_only, check_id):
+    """
+    Export checks to a YAML or JSON file.
+
+    \b
+    Examples:
+      iamwatching checks export --output all_checks.yaml
+      iamwatching checks export --output custom.yaml --custom-only
+      iamwatching checks export --output nist.json --framework NIST
+      iamwatching checks export --output single.yaml --id CIS-AWS-1.4
+    """
+    from iamwatching.patterns.registry import get_registry  # noqa: PLC0415
+    from pathlib import Path as _Path  # noqa: PLC0415
+
+    registry = get_registry()
+    registry.load()
+
+    # Single-check export
+    if check_id:
+        check = registry.get(check_id)
+        if not check:
+            console.print(f"[red]Check {check_id} not found.[/red]")
+            return
+        registry._checks = {check_id: check}
+
+    out = _Path(output)
+    try:
+        if out.suffix.lower() == ".json":
+            n = registry.export_json(out, framework=framework,
+                                     custom_only=custom_only, enabled_only=enabled_only)
+        else:
+            n = registry.export_yaml(out, framework=framework,
+                                     custom_only=custom_only, enabled_only=enabled_only)
+        console.print(f"[green]Exported {n} check(s) to {out}[/green]")
+    except Exception as e:
+        console.print(f"[red]Export failed: {e}[/red]")
+
+
+@checks.command("import")
+@click.argument("input_file", type=click.Path(exists=True))
+@click.option("--target", default="custom",
+              type=click.Choice(["custom", "builtin"]),
+              help="Where to save imported checks (default: custom)")
+@click.option("--overwrite", is_flag=True, help="Overwrite existing checks with the same ID")
+def checks_import(input_file, target, overwrite):
+    """
+    Import checks from a YAML or JSON file.
+
+    Accepts any file exported by 'iamwatching checks export', or any YAML
+    file following the standard check format (framework + checks list).
+
+    \b
+    Examples:
+      iamwatching checks import my_checks.yaml
+      iamwatching checks import team_checks.json --target custom
+      iamwatching checks import updated_cis.yaml --target builtin --overwrite
+    """
+    from iamwatching.patterns.registry import get_registry  # noqa: PLC0415
+
+    registry = get_registry()
+    registry.load()
+    try:
+        n, skipped = registry.import_file(input_file, target=target, overwrite=overwrite)
+        msg = f"[green]Imported {n} check(s) into checks/{target}/[/green]"
+        if skipped:
+            msg += f"\n[yellow]Skipped {len(skipped)} existing check(s): {', '.join(skipped[:5])}{'...' if len(skipped) > 5 else ''}[/yellow]"
+            msg += "\n[dim]Use --overwrite to replace existing checks.[/dim]"
+        console.print(Panel(msg, title="Import Complete", border_style="green"))
+        console.print("[dim]Run: iamwatching checks reload[/dim]")
+    except Exception as e:
+        console.print(f"[red]Import failed: {e}[/red]")
+
+
+@checks.command("write")
+@click.option("--id",             "check_id",      prompt="Check ID (e.g. CUSTOM-001)", help="Unique check identifier")
+@click.option("--title",                           prompt="Title (plain English)",       help="Short check title")
+@click.option("--severity",                        prompt="Severity",
+              type=click.Choice(["CRITICAL","HIGH","MEDIUM","LOW","INFO"]),              help="Severity level")
+@click.option("--framework",  default="CUSTOM",   prompt="Framework name",              help="Framework name (default: CUSTOM)")
+@click.option("--description", default="",        prompt="Description (Enter to skip)", help="What this check looks for")
+@click.option("--recommendation", default="",     prompt="Recommendation (Enter to skip)", help="How to fix findings")
+@click.option("--cypher",                          prompt="Cypher query",                help="Neo4j Cypher query")
+@click.option("--output", "-o", default=None,                                           help="Write to specific file instead of checks/custom/")
+def checks_write(check_id, title, severity, framework, description, recommendation, cypher, output):
+    """
+    Interactively write a new custom check and save it.
+
+    Prompts for all required fields and saves to checks/custom/ as YAML.
+    The check is immediately available after: iamwatching checks reload
+
+    \b
+    Examples:
+      iamwatching checks write
+      iamwatching checks write --id CUSTOM-010 --title "All roles must have description" --severity LOW --cypher "MATCH (r:Principal {principal_type:\'Role\'}) WHERE r.name IS NOT NULL RETURN r.arn AS principal_id, r.name AS name"
+      iamwatching checks write --output my_checks.yaml
+
+    \b
+    Cypher tips:
+      Always include: WHERE p.scan_start_ms >= $scan_start  (scopes to current scan)
+      Return columns: principal_id, resource_id, name, region, issue
     """
     import yaml as _yaml  # noqa: PLC0415
+    from pathlib import Path as _Path  # noqa: PLC0415
     from iamwatching.patterns.registry import get_registry, _find_checks_dir  # noqa: PLC0415
 
-    checks_dir = _find_checks_dir()
-    custom_dir = checks_dir / "custom"
-    custom_dir.mkdir(parents=True, exist_ok=True)
+    # Validate Cypher has basic structure
+    cypher_stripped = cypher.strip()
+    if not cypher_stripped.upper().startswith("MATCH") and not cypher_stripped.upper().startswith("OPTIONAL"):
+        console.print("[yellow]Warning: Cypher query does not start with MATCH. Saving anyway.[/yellow]")
 
-    out_file = custom_dir / f"{check_id.lower().replace('-', '_')}.yaml"
-    check_data = {
-        "framework": framework,
-        "description": f"Custom check: {title}",
-        "checks": [{
-            "id": check_id,
-            "title": title,
-            "severity": severity,
-            "description": description,
-            "cypher": cypher,
-            "recommendation": recommendation,
-            "mitre": [],
-            "references": [],
-        }]
+    # Build the check dict
+    check_def = {
+        "id":             check_id,
+        "title":          title,
+        "severity":       severity,
+        "description":    description or f"{title}",
+        "cypher":         cypher_stripped,
+        "recommendation": recommendation or "Review and remediate the affected resources.",
+        "mitre":          [],
+        "references":     [],
     }
-    with open(out_file, "w") as f:
-        _yaml.dump(check_data, f, default_flow_style=False, allow_unicode=True)
 
-    console.print(f"[green]Check {check_id} saved to {out_file}[/green]")
-    console.print("[dim]Run 'iamwatching checks reload' or restart to pick it up.[/dim]")
+    # Preview
+    console.print()
+    console.print(Panel(
+        f"[bold]ID:[/bold]             {check_id}\n"
+        f"[bold]Title:[/bold]          {title}\n"
+        f"[bold]Severity:[/bold]       [{SEVERITY_COLORS.get(severity,'white')}]{severity}[/{SEVERITY_COLORS.get(severity,'white')}]\n"
+        f"[bold]Framework:[/bold]      {framework}\n"
+        f"[bold]Description:[/bold]    {(description or '—')[:80]}\n"
+        f"[bold]Recommendation:[/bold] {(recommendation or '—')[:80]}\n"
+        f"[bold]Cypher:[/bold]\n[dim]{cypher_stripped[:200]}{'...' if len(cypher_stripped)>200 else ''}[/dim]",
+        title="[bold]New Check Preview[/bold]",
+        border_style="cyan",
+    ))
+
+    if not click.confirm("Save this check?", default=True):
+        console.print("[dim]Cancelled.[/dim]")
+        return
+
+    # Determine output path
+    if output:
+        out_path = _Path(output)
+    else:
+        checks_dir = _find_checks_dir()
+        custom_dir = checks_dir / "custom"
+        custom_dir.mkdir(parents=True, exist_ok=True)
+        safe_fw = re.sub(r"[^a-z0-9_]", "_", framework.lower())
+        out_path = custom_dir / f"{safe_fw}_checks.yaml"
+
+    # Merge into existing file or create new
+    if out_path.exists():
+        try:
+            existing = _yaml.safe_load(out_path.read_text())
+            if isinstance(existing, dict) and "checks" in existing:
+                # Check for duplicate ID
+                existing_ids = {c.get("id") for c in existing.get("checks",[])}
+                if check_id in existing_ids:
+                    if not click.confirm(f"[yellow]Check {check_id} already exists in {out_path.name}. Overwrite?[/yellow]", default=False):
+                        console.print("[dim]Cancelled.[/dim]")
+                        return
+                    existing["checks"] = [c for c in existing["checks"] if c.get("id") != check_id]
+                existing["checks"].append(check_def)
+                out_path.write_text(
+                    _yaml.dump(existing, default_flow_style=False, allow_unicode=True, sort_keys=False),
+                    encoding="utf-8",
+                )
+                n = len(existing["checks"])
+                console.print(f"[green]Check {check_id} added to {out_path} ({n} checks total)[/green]")
+            else:
+                raise ValueError("Unexpected file structure")
+        except Exception:
+            # File exists but malformed — append as new
+            _write_new_file(out_path, framework, check_def)
+    else:
+        _write_new_file(out_path, framework, check_def)
+
+    console.print(f"[dim]Run: iamwatching checks reload[/dim]")
+    console.print(f"[dim]Run: iamwatching checks show {check_id}   to verify[/dim]")
+
+
+def _write_new_file(path, framework: str, check_def: dict):
+    """Write a new YAML checks file with a single check."""
+    import yaml as _yaml  # noqa: PLC0415
+    data = {
+        "framework":   framework,
+        "description": f"Custom checks — {framework}",
+        "checks":      [check_def],
+    }
+    path.write_text(
+        _yaml.dump(data, default_flow_style=False, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    console.print(f"[green]Check saved to {path}[/green]")
 
 
 @checks.command("update")
-@click.option("--builtin", is_flag=True, help="Update built-in checks from latest release")
-def checks_update(builtin):
+@click.option("--family", default=None, multiple=True,
+              help="Specific check family file to update (e.g. --family cis_aws.yaml). "
+                   "Can be specified multiple times. Default: all families.")
+@click.option("--dry-run", is_flag=True,
+              help="Show what would be updated without downloading anything.")
+def checks_update(family, dry_run):
     """
-    Update checks from upstream sources.
+    Download the latest checks from official internet sources.
+
+    Sources include IamWatching curated releases (CIS, OWASP, NIST, PCI, ISO,
+    AWS, Azure, GCP), Prowler, and CloudSploit. Each framework family is stored
+    in its own file so families can be updated independently.
 
     \b
-    Without --builtin: shows instructions for manual update.
-    With --builtin: displays update command for built-in check files.
-    """
-    from iamwatching.patterns.registry import _find_checks_dir  # noqa: PLC0415
-    checks_dir = _find_checks_dir()
+    Examples:
+      iamwatching checks update                     # Update all sources
+      iamwatching checks update --dry-run           # Preview without downloading
+      iamwatching checks update --family cis_aws.yaml --family nist_csf.yaml
 
-    if not builtin:
-        console.print(Panel(
-            "[bold]To update built-in checks:[/bold]\n\n"
-            "  Option 1 — Download latest release:\n"
-            "  [cyan]curl -sL https://github.com/anizacorp/iamwatching/releases/latest/download/checks.tar.gz | tar xz -C checks/[/cyan]\n\n"
-            "  Option 2 — Copy updated YAML files into:[/cyan]\n"
-            f"  [dim]{checks_dir / 'builtin'}[/dim]\n\n"
-            "  Option 3 — Add custom checks in:\n"
-            f"  [dim]{checks_dir / 'custom'}[/dim]\n\n"
-            "  Then run: [cyan]iamwatching checks reload[/cyan]",
-            title="Updating Checks",
-            border_style="blue",
-        ))
+    \b
+    Run 'iamwatching checks sources' to see all available sources.
+    """
+    from iamwatching.patterns.registry import get_registry, _find_checks_dir  # noqa: PLC0415
+    from iamwatching.patterns.updater import (                                 # noqa: PLC0415
+        SOURCES, update_from_sources, get_manifest
+    )
+
+    checks_dir = _find_checks_dir()
+    manifest   = get_manifest(checks_dir)
+
+    # Map --family file names to source IDs
+    if family:
+        source_ids = [s.id for s in SOURCES if s.target_file in family]
+        if not source_ids:
+            console.print(f"[red]Unknown family file(s): {list(family)}[/red]")
+            console.print(f"[dim]Available: {', '.join(s.target_file for s in SOURCES)}[/dim]")
+            return
     else:
-        console.print("[yellow]Built-in update via network not yet implemented.[/yellow]")
-        console.print(f"Manually place YAML files in: [cyan]{checks_dir / 'builtin'}[/cyan]")
+        source_ids = None  # all sources
+
+    n_sources = len(source_ids) if source_ids else len(SOURCES)
+    console.print(
+        Panel(
+            f"[bold]{'[DRY RUN] ' if dry_run else ''}Fetching from {n_sources} source(s)[/bold]\n"
+            f"Checks directory: [cyan]{checks_dir / 'builtin'}[/cyan]\n"
+            + ("[yellow]DRY RUN — no files will be written[/yellow]" if dry_run else
+               "[dim]Existing files will be backed up to checks/.backups/ before overwriting[/dim]"),
+            title="[bold cyan]IamWatching — Check Update[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+
+    with console.status("[bold green]Fetching check definitions from internet sources...[/bold green]"):
+        results = update_from_sources(
+            checks_dir  = checks_dir,
+            source_ids  = source_ids,
+            dry_run     = dry_run,
+            backup      = True,
+        )
+
+    table = Table(box=box.SIMPLE, show_header=True, padding=(0, 1))
+    table.add_column("File",     style="dim",   width=35)
+    table.add_column("Status",                  width=55)
+
+    updated = unchanged = failed = 0
+    for r in results:
+        if r.status in ("updated", "dry_run"):
+            icon, style = "[green]✓[/green]", "green"
+            updated += 1
+        elif r.status == "unchanged":
+            icon, style = "[dim]=[/dim]", "dim"
+            unchanged += 1
+        else:
+            icon, style = "[red]✗[/red]", "red"
+            failed += 1
+
+        status_text = (
+            f"updated ({r.checks_count} checks)" if r.status == "updated" else
+            f"dry_run ({r.checks_count} checks)" if r.status == "dry_run" else
+            f"unchanged ({r.checks_count} checks)" if r.status == "unchanged" else
+            f"FAILED: {r.error[:50]}"
+        )
+        table.add_row(f"{icon}  {r.source_name[:34]}", Text(status_text, style=style))
+
+    console.print(table)
+
+    if dry_run:
+        console.print(f"\n[cyan]{updated} source(s) have updates available. Run without --dry-run to apply.[/cyan]")
+    elif updated:
+        console.print(f"\n[green]{updated} source(s) updated. Reloading registry...[/green]")
+        registry = get_registry()
+        n = registry.load(force=True)
+        console.print(f"[green]{n} checks available.[/green]")
+    else:
+        console.print("\n[dim]All check files are already up to date.[/dim]")
+
+    if failed:
+        console.print(
+            f"[red]{failed} source(s) failed.[/red]\n"
+            "[dim]Check your internet connection or try again. "
+            "Your existing check files were not modified.[/dim]"
+        )
+
+    console.print(
+        f"\n[dim]Run 'iamwatching checks sources' to see all available sources.[/dim]\n"
+        "[dim]Your custom checks in checks/custom/ are never touched by updates.[/dim]"
+    )
+
 
 def main():
     cli()
+
+
+@checks.command("sources")
+def checks_sources():
+    """List all registered internet sources for check updates."""
+    from iamwatching.patterns.updater import SOURCES, get_manifest  # noqa: PLC0415
+    from iamwatching.patterns.registry import _find_checks_dir      # noqa: PLC0415
+
+    manifest = get_manifest(_find_checks_dir())
+    console.print(f"\n[bold]IamWatching Check Sources[/bold]  ({len(SOURCES)} registered)\n")
+
+    table = Table(box=box.ROUNDED, show_lines=True,
+                  title="[bold]Available Check Sources[/bold]")
+    table.add_column("Source ID",   style="cyan",       width=22)
+    table.add_column("Name",                            width=36)
+    table.add_column("Publisher",                       width=20)
+    table.add_column("Checks",      justify="right",    width=7)
+    table.add_column("Last Updated",                    width=12)
+    table.add_column("Target File", style="dim",        width=28)
+
+    for s in SOURCES:
+        last = manifest.get(s.id, {})
+        last_date  = last.get("updated_at", "never")[:10] if last else "never"
+        last_count = str(last.get("checks_count", "?")) if last else "?"
+        table.add_row(
+            s.id, s.name[:36], s.publisher[:20],
+            last_count, last_date,
+            s.target_file,
+        )
+
+    console.print(table)
+    console.print(
+        "\n[dim]Run: iamwatching checks update --source SOURCE_ID   to update a specific source[/dim]\n"
+        "[dim]Run: iamwatching checks update                       to update all sources[/dim]\n"
+    )
 
 
 if __name__ == "__main__":

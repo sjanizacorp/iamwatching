@@ -17,6 +17,7 @@ checks:
     cypher: |
       MATCH (r:Resource)
       WHERE NOT r.tags CONTAINS '"env"'
+        AND r.scan_start_ms >= $scan_start
          OR NOT r.tags CONTAINS '"owner"'
       RETURN labels(r) AS cloud,
              COALESCE(r.arn, r.resource_id) AS resource_id,
@@ -37,8 +38,9 @@ checks:
       All service account identities must follow the naming pattern 'svc-*'
       to distinguish them from human users in audit logs.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
+      MATCH (p:Principal)
       WHERE NOT p.name STARTS WITH 'svc-'
+        AND p.scan_start_ms >= $scan_start
         AND (p.metadata CONTAINS 'access_key' OR p.attached_policy_count > 0)
       RETURN p.arn AS user_arn,
              p.name AS username,

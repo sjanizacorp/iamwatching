@@ -1,405 +1,433 @@
-# NIST CSF 2.0 + NIST SP 800-53 Rev 5 IAM Controls — COMPREHENSIVE
-# Sources:
-#   NIST CSF 2.0: https://www.nist.gov/cyberframework
-#   NIST SP 800-53 Rev 5: https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final
-# All checks use property-based detection (no relationship dependencies).
+# NIST CSF 2.0 + NIST SP 800-53 Rev 5 — ALL CLOUDS
+# Checks use generic Principal and Resource labels so they run on AWS, Azure, and GCP.
+# Scoped to the current scan via scan_start_ms >= $scan_start.
 
 framework: NIST-800-53-R5
 description: >
-  NIST SP 800-53 Rev 5 and NIST CSF 2.0 IAM-relevant controls.
-  Covers Access Control (AC), Identification and Authentication (IA),
-  Configuration Management (CM), and Audit/Accountability (AU) families.
+  NIST SP 800-53 Rev 5 and NIST CSF 2.0 identity and access management controls.
+  Runs on every cloud platform scanned.
 
 checks:
 
-  # ── AC: Access Control ───────────────────────────────────────────────────
-
   - id: NIST-AC-2.1
-    title: "AC-2: Account Management — identify and remove inactive accounts"
+    title: "AC-2: Account Management — unmanaged identities with no policies or tags"
     severity: MEDIUM
     description: >
-      NIST AC-2: Organizations must manage system accounts including creating,
-      activating, modifying, reviewing, disabling, and removing accounts.
-      IAM users with no recorded activity should be reviewed.
+      NIST AC-2: All active identities must be managed, documented, and attributable.
+      Principals with no policies and no tags cannot be governed or attributed to an owner.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE NOT p.name = 'root'
-        AND p.scan_start_ms >= $scan_start
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
         AND (p.attached_policy_count = 0 OR p.attached_policy_count IS NULL)
         AND (p.inline_policy_count = 0 OR p.inline_policy_count IS NULL)
-        AND (p.tags = '{}' OR p.tags IS NULL)
-      RETURN p.arn AS user_arn,
-             p.name AS username,
-             p.metadata AS metadata,
-             'Unmanaged user — no policies and no tags; verify if active' AS issue
-      ORDER BY p.name
+        AND (p.tags = '{}' OR p.tags IS NULL OR p.tags = '')
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
+             p.name AS name,
+             p.principal_type AS type,
+             'Unmanaged identity — no policies and no tags; verify if still needed' AS issue
+      ORDER BY cloud, type, name
       LIMIT 100
     recommendation: >
-      Implement quarterly user access reviews. Disable accounts for users who
-      have left or changed roles. Remove accounts that have been disabled for 90+ days.
+      Review all zero-policy, untagged identities quarterly. Delete unused ones.
+      Add owner, team, and purpose tags. Assign appropriate least-privilege policies.
     mitre: ["T1078 - Valid Accounts"]
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-2/"]
 
   - id: NIST-AC-2.2
-    title: "AC-2(3): Account Management — disable inactive accounts"
+    title: "AC-2(3): Account Management — identities with no recorded activity"
     severity: HIGH
     description: >
-      NIST AC-2(3): The system automatically disables inactive accounts after
-      a defined period. Users who have not logged in or used their access keys
-      within 90 days represent stale credentials.
+      NIST AC-2(3): Inactive accounts must be disabled after a defined period.
+      Identities with no activity represent dormant attack surface.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE NOT p.name = 'root'
-        AND p.scan_start_ms >= $scan_start
-        AND p.metadata CONTAINS 'create_date'
-      RETURN p.arn AS user_arn,
-             p.name AS username,
-             'Review credential report for users inactive >90 days — disable per AC-2(3)' AS action
-      ORDER BY p.name
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type IN ['User', 'ServiceAccount', 'ServicePrincipal']
+        AND NOT p.name = 'root'
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
+             p.name AS name,
+             'Review credential report for unused credentials >90 days — disable per AC-2(3)' AS action
+      ORDER BY cloud, name
       LIMIT 100
     recommendation: >
-      Use AWS Config rule iam-user-unused-credentials-check (90 days).
-      Automate disable via Lambda triggered by Config non-compliance.
-    mitre: ["T1078.004 - Cloud Accounts"]
+      Enforce automated disable of identities inactive for 90+ days using
+      cloud-native tools (AWS Config, Azure AD Access Reviews, GCP IAM Recommender).
+    mitre: ["T1078 - Valid Accounts"]
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-2/"]
 
   - id: NIST-AC-3.1
-    title: "AC-3: Access Enforcement — verify role-based access control"
+    title: "AC-3: Access Enforcement — direct policy attachments on user identities"
     severity: MEDIUM
     description: >
-      NIST AC-3: The system enforces approved authorizations for logical access.
-      All principals should have role-based access via groups/roles, not
-      direct policy attachment.
+      NIST AC-3: Access must be enforced through role-based access control.
+      Permissions attached directly to individual user accounts violate RBAC principles
+      and make access revocation during offboarding error-prone.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE p.attached_policy_count > 0
-        AND p.scan_start_ms >= $scan_start
-         OR p.inline_policy_count > 0
-      RETURN p.arn AS user_arn,
-             p.name AS username,
-             p.attached_policy_count AS attached_count,
-             p.inline_policy_count AS inline_count,
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type = 'User'
+        AND (p.attached_policy_count > 0 OR p.inline_policy_count > 0)
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
+             p.name AS name,
+             COALESCE(p.attached_policy_count, 0) AS attached_policies,
+             COALESCE(p.inline_policy_count, 0) AS inline_policies,
              'User has direct policy attachments — migrate to group/role-based access per AC-3' AS issue
-      ORDER BY (p.attached_policy_count + p.inline_policy_count) DESC
+      ORDER BY (COALESCE(p.attached_policy_count,0) + COALESCE(p.inline_policy_count,0)) DESC
       LIMIT 100
     recommendation: >
-      Create IAM groups for each job function. Assign policies to groups.
-      Add users to groups. Remove all directly attached and inline user policies.
+      AWS: Move user policies to IAM groups. Azure: Use Azure AD groups with RBAC roles.
+      GCP: Assign roles to groups, not individual service accounts.
     mitre: ["T1078 - Valid Accounts"]
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-3/"]
 
   - id: NIST-AC-5.1
-    title: "AC-5: Separation of Duties — admin functions not shared"
+    title: "AC-5: Separation of Duties — admin identities with console access"
     severity: HIGH
     description: >
-      NIST AC-5: Separation of duties prevents any individual from having
-      complete control over critical processes. Admin principals should be
-      dedicated and not used for day-to-day operations.
+      NIST AC-5: Admin accounts must be separate from daily-use accounts.
+      An identity with both admin-level permissions and interactive access
+      means a phished session immediately yields admin control.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE (p.attached_policies CONTAINS 'AdministratorAccess'
-        AND p.scan_start_ms >= $scan_start
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type = 'User'
+        AND (p.attached_policies CONTAINS 'AdministratorAccess'
+          OR p.attached_policies CONTAINS 'Owner'
           OR p.inline_policies CONTAINS '"Action": "*"')
-        AND p.metadata CONTAINS 'password_last_used'
-      RETURN p.arn AS user_arn,
-             p.name AS username,
-             'Admin user also has console access — may violate separation of duties' AS issue
-      ORDER BY p.name
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
+             p.name AS name,
+             'Admin-level user with interactive access — may violate separation of duties' AS issue
+      ORDER BY cloud, name
+      LIMIT 50
     recommendation: >
-      Admin users should be separate from daily-use accounts.
-      Use IAM Identity Center (SSO) for admin access with dedicated admin accounts.
-      Normal work should use non-admin accounts.
+      Create dedicated admin accounts separate from daily-use accounts.
+      Use privileged access workstations (PAWs) for admin operations.
+      Enforce MFA and session limits on all admin accounts.
     mitre: ["T1078 - Valid Accounts", "T1548 - Abuse Elevation Control Mechanism"]
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-5/"]
 
   - id: NIST-AC-6.1
-    title: "AC-6: Least Privilege — identify over-privileged principals"
+    title: "AC-6: Least Privilege — identities with admin or wildcard permissions"
     severity: HIGH
     description: >
-      NIST AC-6: Employ the principle of least privilege — allow only the
-      authorized access for users and processes necessary to accomplish
-      assigned tasks. Wildcard or admin policies violate this principle.
+      NIST AC-6: Employ least privilege — allow only the access necessary for
+      assigned tasks. Admin or wildcard permissions violate least privilege across
+      all cloud platforms.
     cypher: |
-      MATCH (p:AWSPrincipal)
-      WHERE p.attached_policies CONTAINS 'AdministratorAccess'
-        AND p.scan_start_ms >= $scan_start
-         OR p.inline_policies CONTAINS '"Action": "*"'
-         OR p.inline_policies CONTAINS '"Action":["*"]'
-      RETURN p.arn AS principal_arn,
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND (p.attached_policies CONTAINS 'AdministratorAccess'
+          OR p.attached_policies CONTAINS 'Owner'
+          OR p.attached_policies CONTAINS 'roles/owner'
+          OR p.attached_policies CONTAINS 'roles/editor'
+          OR p.inline_policies CONTAINS '"Action": "*"'
+          OR p.inline_policies CONTAINS '"Action":["*"]')
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
              p.name AS name,
              p.principal_type AS type,
-             'Principal has admin or wildcard permissions — violates AC-6 least privilege' AS issue
-      ORDER BY p.principal_type, p.name
+             'Identity has admin or wildcard permissions — violates AC-6 least privilege' AS issue
+      ORDER BY cloud, type, name
     recommendation: >
-      Use IAM Access Analyzer to generate least-privilege policies from
-      CloudTrail activity. Remove AdministratorAccess except from break-glass accounts.
+      Replace admin/wildcard policies with least-privilege equivalents.
+      AWS: Use IAM Access Analyzer. Azure: Use Azure AD PIM.
+      GCP: Use IAM Recommender to generate least-privilege replacements.
     mitre: ["T1078 - Valid Accounts", "T1548 - Abuse Elevation Control Mechanism"]
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-6/"]
 
   - id: NIST-AC-6.2
-    title: "AC-6(2): Least Privilege — non-privileged access for non-security functions"
+    title: "AC-6(2): Least Privilege — non-admin users with elevated permissions"
     severity: MEDIUM
     description: >
-      NIST AC-6(2): Users must use non-privileged accounts for general computing
-      activities. Accounts with admin access should not be used for routine tasks.
+      NIST AC-6(2): Users must use non-privileged accounts for general activities.
+      Accounts that are not named as admin accounts but hold admin-level permissions
+      suggest improper access grants without documented justification.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE (p.attached_policies CONTAINS 'AdministratorAccess'
-        AND p.scan_start_ms >= $scan_start
-          OR p.attached_policies CONTAINS 'PowerUserAccess')
-        AND NOT toLower(p.name) CONTAINS 'admin'
-        AND NOT toLower(p.name) CONTAINS 'svc'
-        AND NOT toLower(p.name) CONTAINS 'break'
-      RETURN p.arn AS user_arn,
-             p.name AS username,
-             'Non-admin-named user has Administrator or PowerUser access — review use case' AS issue
-      ORDER BY p.name
-    recommendation: >
-      Ensure admin-level access is only granted to dedicated administrative accounts
-      named clearly as such (e.g., sj-admin, breakglass-admin). Separate from daily-use accounts.
-    mitre: ["T1078.004 - Cloud Accounts"]
-    references: ["https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-6/"]
-
-  - id: NIST-AC-6.5
-    title: "AC-6(5): Least Privilege — privileged accounts"
-    severity: MEDIUM
-    description: >
-      NIST AC-6(5): Restrict privileged accounts to only those individuals
-      requiring such privileges. Track all privileged accounts explicitly.
-    cypher: |
-      MATCH (p:AWSPrincipal)
-      WHERE p.attached_policies CONTAINS 'AdministratorAccess'
-        AND p.scan_start_ms >= $scan_start
-         OR p.attached_policies CONTAINS 'PowerUserAccess'
-         OR p.attached_policies CONTAINS 'IAMFullAccess'
-      RETURN p.arn AS principal_arn,
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type = 'User'
+        AND (p.attached_policies CONTAINS 'AdministratorAccess'
+          OR p.attached_policies CONTAINS 'PowerUserAccess'
+          OR p.attached_policies CONTAINS 'Owner')
+        AND NOT toLower(COALESCE(p.name,'')) CONTAINS 'admin'
+        AND NOT toLower(COALESCE(p.name,'')) CONTAINS 'break'
+        AND NOT toLower(COALESCE(p.name,'')) CONTAINS 'svc'
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
              p.name AS name,
-             p.principal_type AS type,
-             'Privileged account — verify this is intentional and owner is documented' AS issue
-      ORDER BY p.principal_type, p.name
+             'Non-admin-named user has elevated permissions — review and document justification' AS issue
+      ORDER BY cloud, name
     recommendation: >
-      Maintain an inventory of all privileged accounts. Review quarterly.
-      Require manager approval and documentation for all privileged access grants.
+      Document business justification for every elevated access grant.
+      Use a dedicated admin account naming convention (e.g. firstname-admin).
     mitre: ["T1078 - Valid Accounts"]
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-6/"]
 
-  # ── IA: Identification and Authentication ────────────────────────────────
+  - id: NIST-AC-6.5
+    title: "AC-6(5): Least Privilege — inventory of all privileged identities"
+    severity: MEDIUM
+    description: >
+      NIST AC-6(5): Restrict privileged access and maintain an explicit inventory
+      of all privileged accounts across all cloud platforms.
+    cypher: |
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND (p.attached_policies CONTAINS 'AdministratorAccess'
+          OR p.attached_policies CONTAINS 'PowerUserAccess'
+          OR p.attached_policies CONTAINS 'IAMFullAccess'
+          OR p.attached_policies CONTAINS 'Owner'
+          OR p.attached_policies CONTAINS 'roles/owner'
+          OR p.inline_policies CONTAINS '"Action": "*"')
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
+             p.name AS name,
+             p.principal_type AS type,
+             'Privileged identity — ensure documented in access inventory, reviewed quarterly' AS action
+      ORDER BY cloud, type, name
+    recommendation: >
+      Maintain a formal inventory of all privileged accounts with owner, purpose,
+      and last-review-date. Review quarterly. Require manager approval for all grants.
+    mitre: ["T1078 - Valid Accounts"]
+    references: ["https://csf.tools/reference/nist-sp-800-53/r5/ac/ac-6/"]
 
   - id: NIST-IA-2.1
-    title: "IA-2: Identification and Authentication — MFA for all users"
+    title: "IA-2: Identification and Authentication — MFA for all user identities"
     severity: HIGH
     description: >
-      NIST IA-2: The system uniquely identifies and authenticates organizational
-      users. Multi-factor authentication is required for all privileged and
-      non-privileged user accounts accessing cloud management consoles.
+      NIST IA-2: All user accounts accessing cloud management interfaces must use
+      multi-factor authentication. This applies across AWS, Azure, and GCP.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE NOT p.name = 'root'
-        AND p.scan_start_ms >= $scan_start
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type = 'User'
+        AND NOT p.name = 'root'
         AND NOT p.metadata CONTAINS '"mfa_active": true'
-      RETURN p.arn AS user_arn,
-             p.name AS username,
-             'User does not have MFA — violates IA-2 identification requirements' AS issue
-      ORDER BY p.name
+        AND NOT p.metadata CONTAINS '"mfa_enabled": true'
+        AND NOT p.metadata CONTAINS '"strong_auth": true'
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
+             p.name AS name,
+             'User does not have MFA — violates IA-2 authentication requirements' AS issue
+      ORDER BY cloud, name
     recommendation: >
-      Enforce MFA via IAM policy conditions (aws:MultiFactorAuthPresent=true).
-      Use AWS IAM Identity Center for centralized MFA management.
-    mitre: ["T1078.004 - Cloud Accounts", "T1556 - Modify Authentication Process"]
+      AWS: Enforce via SCP (aws:MultiFactorAuthPresent=true).
+      Azure: Enable MFA via Conditional Access or Security Defaults.
+      GCP: Enforce 2-Step Verification in Admin Console.
+    mitre: ["T1078 - Valid Accounts", "T1556 - Modify Authentication Process"]
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/ia/ia-2/"]
 
   - id: NIST-IA-2.2
-    title: "IA-2(1): Identification and Authentication — MFA for privileged accounts"
+    title: "IA-2(1): Identification and Authentication — MFA required for privileged accounts"
     severity: CRITICAL
     description: >
-      NIST IA-2(1): MFA is required for privileged account access. Any privileged
-      account (admin, power user) without MFA represents a critical authentication gap.
+      NIST IA-2(1): MFA is mandatory for all privileged account access.
+      A privileged account without MFA is a critical authentication gap that
+      can lead to full cloud account compromise.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE (p.attached_policies CONTAINS 'AdministratorAccess'
-        AND p.scan_start_ms >= $scan_start
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type = 'User'
+        AND (p.attached_policies CONTAINS 'AdministratorAccess'
           OR p.attached_policies CONTAINS 'PowerUserAccess'
-          OR p.attached_policies CONTAINS 'IAMFullAccess')
+          OR p.attached_policies CONTAINS 'IAMFullAccess'
+          OR p.attached_policies CONTAINS 'Owner')
         AND NOT p.metadata CONTAINS '"mfa_active": true'
-      RETURN p.arn AS user_arn,
-             p.name AS username,
+        AND NOT p.metadata CONTAINS '"mfa_enabled": true'
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
+             p.name AS name,
              'CRITICAL: Privileged user without MFA — immediate risk of account takeover' AS issue
-      ORDER BY p.name
+      ORDER BY cloud, name
     recommendation: >
-      Immediately require MFA for all privileged accounts. Use a deny-all SCP
-      for accounts not using MFA. This is a critical finding requiring same-day remediation.
-    mitre: ["T1078.004 - Cloud Accounts"]
+      Immediately require MFA for all privileged accounts. Block console access
+      without MFA using SCPs (AWS), Conditional Access (Azure), or org policies (GCP).
+    mitre: ["T1078 - Valid Accounts"]
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/ia/ia-2/"]
 
   - id: NIST-IA-5.1
-    title: "IA-5: Authenticator Management — credential rotation"
+    title: "IA-5: Authenticator Management — credential age and rotation"
     severity: HIGH
     description: >
-      NIST IA-5: The organization manages system authenticators by establishing
-      minimum and maximum lifetime restrictions and reuse conditions.
-      Access keys older than 90 days violate this control.
+      NIST IA-5: Authenticators (access keys, passwords, service account keys)
+      must have defined lifetimes and rotation requirements.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE p.metadata CONTAINS 'access_key'
-        AND p.scan_start_ms >= $scan_start
-        AND NOT p.name = 'root'
-      RETURN p.arn AS user_arn,
-             p.name AS username,
-             'Verify access key age via IAM credential report — rotate if >90 days per IA-5' AS action
-      ORDER BY p.name
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type IN ['User', 'ServiceAccount']
+        AND p.metadata CONTAINS 'key'
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
+             p.name AS name,
+             'Verify credential age via cloud console — rotate any key older than 90 days' AS action
+      ORDER BY cloud, name
       LIMIT 100
     recommendation: >
-      Rotate all access keys at least every 90 days. Use AWS Secrets Manager
-      for automated rotation. Set Config rule access-keys-rotated.
-    mitre: ["T1078.004 - Cloud Accounts", "T1098.001 - Additional Cloud Credentials"]
+      AWS: Rotate access keys every 90 days. Use Config rule access-keys-rotated.
+      Azure: Rotate service principal secrets and certificates annually.
+      GCP: Rotate service account keys every 90 days. Prefer Workload Identity.
+    mitre: ["T1078 - Valid Accounts", "T1098.001 - Additional Cloud Credentials"]
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/ia/ia-5/"]
 
   - id: NIST-IA-5.2
-    title: "IA-5(1): Authenticator Management — password complexity enforcement"
+    title: "IA-5(1): Authenticator Management — password complexity"
     severity: MEDIUM
     description: >
-      NIST IA-5(1): Password-based authenticators must enforce minimum complexity
-      requirements including length, character set diversity, and reuse restrictions.
+      NIST IA-5(1): Password-based authenticators must enforce minimum complexity.
+      Verify the cloud platform's password policy meets NIST requirements.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE NOT p.name = 'root'
-        AND p.scan_start_ms >= $scan_start
-      WITH count(p) AS user_count
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type = 'User'
+      WITH labels(p) AS cloud, count(p) AS user_count
       WHERE user_count > 0
-      RETURN user_count,
-             'Manual check: verify IAM password policy meets IA-5(1) requirements (14+ chars, complexity, no reuse)' AS action
-      LIMIT 1
+      RETURN cloud,
+             user_count,
+             'Manual check: verify password policy requires 14+ chars with complexity per IA-5(1)' AS action
+      ORDER BY cloud
     recommendation: >
-      IAM password policy: minimum 14 chars, uppercase, lowercase, numbers, symbols,
-      no reuse of last 24, max age 90 days.
+      AWS: IAM Account Settings → Password Policy (14+ chars, complexity, no reuse).
+      Azure: Conditional Access → Authentication strengths.
+      GCP: Admin Console → Security → Password management.
     mitre: ["T1110 - Brute Force"]
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/ia/ia-5/"]
 
-  # ── CM: Configuration Management ────────────────────────────────────────
-
   - id: NIST-CM-2.1
-    title: "CM-2: Baseline Configuration — resource inventory completeness"
+    title: "CM-2: Baseline Configuration — untagged resources missing from inventory"
     severity: LOW
     description: >
-      NIST CM-2: The organization develops, documents, and maintains a current
-      baseline configuration. Resources without tags cannot be included in
-      a complete baseline inventory.
+      NIST CM-2: A current baseline configuration must be maintained. Resources
+      without tags cannot be included in a configuration baseline or inventory.
     cypher: |
       MATCH (r:Resource)
-      WHERE r.tags = '{}' OR r.tags IS NULL
-        AND r.scan_start_ms >= $scan_start
+      WHERE r.scan_start_ms >= $scan_start
+        AND (r.tags = '{}' OR r.tags IS NULL OR r.tags = '')
       RETURN labels(r) AS cloud,
              r.resource_type AS type,
              COALESCE(r.arn, r.resource_id) AS resource_id,
              r.name AS name,
+             r.region AS region,
              'Untagged resource — missing from configuration baseline per CM-2' AS issue
       ORDER BY cloud, type
       LIMIT 100
     recommendation: >
-      Enforce tagging policies via AWS Organizations. Require: owner, team,
-      environment, cost-center tags on all resources. Reject untagged resource
-      creation via SCPs.
+      Enforce mandatory tagging via AWS Tag Policies, Azure Policy, or GCP Org Constraints.
+      Required tags: owner, team, environment, cost-center.
     mitre: []
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/cm/cm-2/"]
 
   - id: NIST-CM-5.1
-    title: "CM-5: Access Restrictions for Change — IAM change control"
+    title: "CM-5: Access Restrictions for Change — identities that can modify IAM"
     severity: HIGH
     description: >
-      NIST CM-5: The organization defines, documents, approves, and enforces
-      physical and logical access restrictions associated with changes to the system.
-      Principals able to modify IAM represent an unrestricted change control gap.
+      NIST CM-5: Access restrictions must be enforced for changes to the system.
+      Identities able to modify IAM policies can grant themselves any permission,
+      bypassing all other access controls.
     cypher: |
-      MATCH (p:AWSPrincipal)
-      WHERE p.inline_policies CONTAINS 'iam:CreateRole'
-        AND p.scan_start_ms >= $scan_start
-         OR p.inline_policies CONTAINS 'iam:AttachRolePolicy'
-         OR p.inline_policies CONTAINS 'iam:PutRolePolicy'
-         OR p.attached_policies CONTAINS 'IAMFullAccess'
-         OR p.inline_policies CONTAINS '"Action": "iam:*"'
-      RETURN p.arn AS principal_arn,
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND (p.inline_policies CONTAINS 'iam:CreatePolicy'
+          OR p.inline_policies CONTAINS 'iam:AttachRolePolicy'
+          OR p.inline_policies CONTAINS 'iam:PutRolePolicy'
+          OR p.attached_policies CONTAINS 'IAMFullAccess'
+          OR p.inline_policies CONTAINS '"Action": "iam:*"'
+          OR p.attached_policies CONTAINS 'User Access Administrator'
+          OR p.attached_policies CONTAINS 'roles/iam.admin')
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
              p.name AS name,
              p.principal_type AS type,
-             'Principal can modify IAM — verify change control process is enforced per CM-5' AS issue
-      ORDER BY p.principal_type, p.name
+             'Identity can modify IAM — potential privilege escalation; enforce change control' AS issue
+      ORDER BY cloud, type, name
     recommendation: >
-      Restrict IAM write permissions to a break-glass admin role with MFA condition.
-      Require all IAM changes to go through an approved change management process.
-      Use SCPs to prevent IAM changes outside approved accounts.
+      Restrict IAM write permissions to dedicated admin roles with MFA conditions.
+      Require change control approval for all IAM policy changes.
+      Use SCPs/Org Policies to prevent IAM changes outside approved accounts.
     mitre: ["T1484 - Domain Policy Modification"]
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/cm/cm-5/"]
 
-  # ── AU: Audit and Accountability ─────────────────────────────────────────
-
   - id: NIST-AU-6.1
-    title: "AU-6: Audit Review, Analysis, and Reporting — unmonitored resources"
+    title: "AU-6: Audit Review — identities with no tags cannot be attributed"
     severity: MEDIUM
     description: >
-      NIST AU-6: The organization reviews and analyzes system audit records
-      for indications of inappropriate or unusual activity. Resources without
-      owner tags cannot be attributed during incident investigation.
+      NIST AU-6: Audit records must be reviewed for inappropriate activity.
+      Identities without owner tags cannot be attributed to individuals during
+      incident investigation.
     cypher: |
-      MATCH (p:AWSPrincipal)
-      WHERE (p.tags = '{}' OR p.tags IS NULL)
-        AND p.scan_start_ms >= $scan_start
-        AND p.principal_type IN ['User', 'Role']
-      RETURN p.arn AS principal_arn,
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND (p.tags = '{}' OR p.tags IS NULL OR p.tags = '')
+        AND p.principal_type IN ['User', 'Role', 'ServiceAccount', 'ServicePrincipal']
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
              p.name AS name,
              p.principal_type AS type,
              'Untagged identity — cannot attribute activity during AU-6 audit review' AS issue
-      ORDER BY p.principal_type, p.name
+      ORDER BY cloud, type, name
       LIMIT 100
     recommendation: >
-      Apply owner, team, and purpose tags to all IAM identities. Required for
-      incident attribution during audit reviews.
+      Apply owner, team, and purpose tags to all cloud identities.
+      This is required for incident attribution during audit reviews.
     mitre: []
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/au/au-6/"]
 
   - id: NIST-AU-12.1
-    title: "AU-12: Audit Record Generation — compute resource traceability"
+    title: "AU-12: Audit Record Generation — untagged compute resources"
     severity: MEDIUM
     description: >
-      NIST AU-12: Provide audit record generation capability for the events
-      defined in AU-2. Compute resources (Lambda, EC2) should be attributable
-      to owners via tags for audit trail completeness.
+      NIST AU-12: All system components must generate audit records.
+      Untagged compute resources cannot be attributed to owners or included
+      in audit trail analysis.
     cypher: |
       MATCH (r:Resource)
-      WHERE r.resource_type IN ['lambda:Function', 'ec2:Instance', 'ecs:TaskDefinition']
-        AND r.scan_start_ms >= $scan_start
-        AND (r.tags = '{}' OR r.tags IS NULL)
+      WHERE r.scan_start_ms >= $scan_start
+        AND r.resource_type IN [
+          'lambda:Function', 'ec2:Instance', 'ecs:TaskDefinition',
+          'eks:Cluster', 'Microsoft.Web/sites', 'Microsoft.Compute/virtualMachines',
+          'Microsoft.ContainerService/managedClusters',
+          'container:Cluster', 'run:Service', 'cloudfunctions:Function',
+          'sqladmin:Instance'
+        ]
+        AND (r.tags = '{}' OR r.tags IS NULL OR r.tags = '')
       RETURN labels(r) AS cloud,
              r.resource_type AS type,
              COALESCE(r.arn, r.resource_id) AS resource_id,
              r.name AS name,
+             r.region AS region,
              'Untagged compute resource — AU-12 audit trail attribution impossible' AS issue
-      ORDER BY r.resource_type, r.name
+      ORDER BY cloud, r.resource_type, r.name
       LIMIT 100
     recommendation: >
       Tag all compute resources with owner, team, and application identifiers.
-      Enable CloudTrail data events for Lambda and S3.
+      Enable cloud-native audit logging (CloudTrail, Azure Monitor, GCP Cloud Audit Logs).
     mitre: []
     references: ["https://csf.tools/reference/nist-sp-800-53/r5/au/au-12/"]
 
-  # ── NIST CSF 2.0 Specific Controls ──────────────────────────────────────
-
   - id: NIST-CSF-GV.RM-01
-    title: "GOVERN — Risk Management Strategy: identity risk posture"
+    title: "GOVERN — Risk Management: privileged identity count"
     severity: LOW
     description: >
-      NIST CSF 2.0 GV.RM-01: Organizational risk management priorities inform
-      cybersecurity strategy. Count of privileged accounts is a key risk metric.
+      NIST CSF 2.0 GV.RM-01: The count of privileged identities is a key risk metric
+      that must be tracked and kept within organisation-defined thresholds.
     cypher: |
-      MATCH (p:AWSPrincipal)
-      WHERE p.attached_policies CONTAINS 'AdministratorAccess'
-        AND p.scan_start_ms >= $scan_start
-         OR p.attached_policies CONTAINS 'PowerUserAccess'
-         OR p.attached_policies CONTAINS 'IAMFullAccess'
-         OR p.inline_policies CONTAINS '"Action": "*"'
-      RETURN count(p) AS privileged_count,
-             collect(DISTINCT p.principal_type) AS principal_types,
-             'Track privileged identity count as a key risk metric per NIST CSF GV.RM-01' AS action
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND (p.attached_policies CONTAINS 'AdministratorAccess'
+          OR p.attached_policies CONTAINS 'PowerUserAccess'
+          OR p.attached_policies CONTAINS 'IAMFullAccess'
+          OR p.attached_policies CONTAINS 'Owner'
+          OR p.attached_policies CONTAINS 'roles/owner'
+          OR p.inline_policies CONTAINS '"Action": "*"')
+      RETURN labels(p) AS cloud,
+             count(p) AS privileged_count,
+             'Track privileged identity count as a key risk metric per GV.RM-01' AS action
+      ORDER BY cloud
     recommendation: >
-      Set a risk tolerance for the number of privileged accounts (recommend <5).
-      Document each privileged account with business justification and review quarterly.
+      Set a risk tolerance for the number of privileged identities per cloud (recommend <5).
+      Document each with business justification, approver, and review date.
     mitre: []
     references: ["https://www.nist.gov/cyberframework"]
 
@@ -407,95 +435,100 @@ checks:
     title: "IDENTIFY — Asset Management: cloud identity inventory"
     severity: LOW
     description: >
-      NIST CSF 2.0 ID.AM-01: Inventories of hardware assets, software assets,
-      services, and identities are maintained. Every IAM identity must be
-      documented and attributed to an owner.
+      NIST CSF 2.0 ID.AM-01: All cloud identities must be inventoried with
+      documented owners and purposes.
     cypher: |
-      MATCH (p:AWSPrincipal)
+      MATCH (p:Principal)
       WHERE p.scan_start_ms >= $scan_start
-      RETURN p.principal_type AS type,
+      RETURN labels(p) AS cloud,
+             p.principal_type AS type,
              count(p) AS count,
              sum(CASE WHEN p.tags = '{}' OR p.tags IS NULL THEN 1 ELSE 0 END) AS untagged_count,
-             'Asset inventory: ' + p.principal_type + ' principals in graph' AS inventory_item
-      ORDER BY count DESC
+             'Identity asset inventory — untagged identities lack owner attribution' AS action
+      ORDER BY cloud, type
     recommendation: >
-      Maintain a formal inventory of all IAM principals with owner, purpose,
-      and last-review-date. Use AWS Resource Explorer or Config for automated inventory.
+      Maintain a formal identity inventory. Use cloud-native discovery tools
+      (AWS IAM Access Advisor, Azure AD Access Reviews, GCP IAM Recommender).
     mitre: []
     references: ["https://www.nist.gov/cyberframework"]
 
   - id: NIST-CSF-PR.AA-01
-    title: "PROTECT — Identities and credentials for authorized users are managed"
+    title: "PROTECT — Identity governance: unmanaged identities with no policies"
     severity: MEDIUM
     description: >
-      NIST CSF 2.0 PR.AA-01: IAM principals with no policies and no tags
-      represent unmanaged identities that cannot be properly governed.
+      NIST CSF 2.0 PR.AA-01: All identities must be managed. Principals with
+      no policies and no tags cannot be governed.
     cypher: |
-      MATCH (p:AWSPrincipal)
-      WHERE (p.attached_policy_count = 0 OR p.attached_policy_count IS NULL)
-        AND p.scan_start_ms >= $scan_start
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND (p.attached_policy_count = 0 OR p.attached_policy_count IS NULL)
         AND (p.inline_policy_count = 0 OR p.inline_policy_count IS NULL)
-        AND (p.tags = '{}' OR p.tags IS NULL)
-        AND p.principal_type IN ['User', 'Role']
-      RETURN p.principal_type AS type,
-             p.arn AS principal,
+        AND (p.tags = '{}' OR p.tags IS NULL OR p.tags = '')
+        AND p.principal_type IN ['User', 'Role', 'ServiceAccount', 'ServicePrincipal']
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
              p.name AS name,
-             'Unmanaged principal — no policies and no tags — cannot govern per PR.AA-01' AS issue
-      ORDER BY p.principal_type, p.name
+             p.principal_type AS type,
+             'Unmanaged identity — no policies and no tags; cannot govern per PR.AA-01' AS issue
+      ORDER BY cloud, type, name
       LIMIT 100
     recommendation: >
-      Review all zero-policy, untagged identities. Delete those no longer needed.
-      Add owner tags. Assign appropriate least-privilege policies.
+      Delete unused identities. Add owner tags. Assign appropriate least-privilege policies.
+      Implement a joiner-mover-leaver process across all cloud platforms.
     mitre: ["T1078 - Valid Accounts"]
     references: ["https://www.nist.gov/cyberframework"]
 
   - id: NIST-CSF-PR.AA-05
-    title: "PROTECT — Access permissions and authorizations are managed"
+    title: "PROTECT — Access permissions: identities that can modify IAM"
     severity: HIGH
     description: >
-      NIST CSF 2.0 PR.AA-05: Principals with IAM write permissions can modify
-      policies and effectively self-escalate to administrator privileges.
+      NIST CSF 2.0 PR.AA-05: Identities with IAM write permissions can grant
+      themselves any permission, effectively bypassing all access controls.
     cypher: |
-      MATCH (p:AWSPrincipal)
-      WHERE p.inline_policies CONTAINS 'iam:CreatePolicy'
-        AND p.scan_start_ms >= $scan_start
-         OR p.inline_policies CONTAINS 'iam:AttachRolePolicy'
-         OR p.inline_policies CONTAINS 'iam:PutRolePolicy'
-         OR p.attached_policies CONTAINS 'IAMFullAccess'
-         OR p.inline_policies CONTAINS '"Action": "iam:*"'
-      RETURN p.arn AS principal_arn,
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND (p.inline_policies CONTAINS 'iam:CreatePolicy'
+          OR p.inline_policies CONTAINS 'iam:AttachRolePolicy'
+          OR p.inline_policies CONTAINS 'iam:PutRolePolicy'
+          OR p.attached_policies CONTAINS 'IAMFullAccess'
+          OR p.inline_policies CONTAINS '"Action": "iam:*"'
+          OR p.attached_policies CONTAINS 'User Access Administrator'
+          OR p.attached_policies CONTAINS 'roles/iam.admin')
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
              p.name AS name,
              p.principal_type AS type,
-             'Principal can modify IAM — potential privilege escalation via PR.AA-05 violation' AS issue
-      ORDER BY p.principal_type, p.name
+             'Identity can modify IAM — potential privilege escalation per PR.AA-05' AS issue
+      ORDER BY cloud, type, name
     recommendation: >
-      Restrict IAM write permissions to dedicated admin roles with MFA condition.
-      Require change control approval for all IAM policy changes.
-    mitre: ["T1484 - Domain Policy Modification", "T1078.004 - Cloud Accounts"]
+      Restrict IAM write permissions to break-glass admin roles with MFA conditions.
+      Audit all IAM changes via CloudTrail/Azure Monitor/GCP Audit Logs.
+    mitre: ["T1484 - Domain Policy Modification", "T1078 - Valid Accounts"]
     references: ["https://www.nist.gov/cyberframework"]
 
   - id: NIST-CSF-DE.CM-03
-    title: "DETECT — Personnel activity and technology usage are monitored"
+    title: "DETECT — Activity monitoring: users with permissions but no activity"
     severity: MEDIUM
     description: >
-      NIST CSF 2.0 DE.CM-03: IAM users with no recorded console activity
-      but active permissions represent a detection gap — dormant accounts
-      with active permissions cannot be monitored.
+      NIST CSF 2.0 DE.CM-03: Identities with permissions but no recorded activity
+      represent a detection gap — dormant accounts with active permissions.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE NOT p.name = 'root'
-        AND p.scan_start_ms >= $scan_start
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type = 'User'
+        AND NOT p.name = 'root'
         AND (p.attached_policy_count > 0 OR p.inline_policy_count > 0)
-        AND (NOT p.metadata CONTAINS 'password_last_used'
-             OR p.metadata CONTAINS '"password_last_used": null')
-      RETURN p.arn AS user_arn,
-             p.name AS username,
-             p.attached_policy_count AS policies,
-             'User has permissions but no recorded console activity — monitoring gap per DE.CM-03' AS issue
-      ORDER BY p.name
+        AND (NOT p.metadata CONTAINS 'last_used'
+          OR p.metadata CONTAINS '"last_used": null')
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
+             p.name AS name,
+             COALESCE(p.attached_policy_count, 0) AS policies,
+             'User has permissions but no recorded activity — monitoring gap per DE.CM-03' AS issue
+      ORDER BY cloud, name
       LIMIT 100
     recommendation: >
-      Disable accounts with no login activity in 45+ days. Enable CloudWatch
-      alarms on console sign-in events for all users. Review monthly.
-    mitre: ["T1078.004 - Cloud Accounts"]
+      Disable accounts with no login activity for 45+ days.
+      Enable alerting on first-time logins and unusual access patterns.
+    mitre: ["T1078 - Valid Accounts"]
     references: ["https://www.nist.gov/cyberframework"]

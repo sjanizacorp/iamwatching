@@ -1,33 +1,33 @@
-# ISO/IEC 27001:2022 — IAM-Relevant Controls
-# Source: https://www.iso.org/standard/27001
-# Annex A controls mapped to detectable IAM patterns.
+# ISO/IEC 27001:2022 — Information Security Controls — ALL CLOUDS
+# Uses generic Principal/Resource labels — runs on AWS, Azure, and GCP.
 
 framework: ISO-27001-2022
 description: >
-  ISO/IEC 27001:2022 Annex A information security controls
-  applicable to identity and access management (A.5, A.8).
+  ISO/IEC 27001:2022 Annex A information security controls for IAM.
+  Runs on every cloud platform scanned.
 
 checks:
 
   - id: ISO-A.5.15
-    title: "A.5.15: Access Control — access control policy enforcement"
+    title: "A.5.15: Access Control — policy enforcement across all clouds"
     severity: MEDIUM
     description: >
-      ISO 27001 A.5.15: Rules to control physical and logical access to information
-      and other associated assets shall be established and implemented based on
-      business and information security requirements.
+      ISO 27001 A.5.15: Access control rules shall be established and implemented
+      based on business and information security requirements. This inventory
+      check confirms all identities with policies are documented.
     cypher: |
-      MATCH (p:AWSPrincipal)
-      WHERE p.attached_policy_count > 0 OR p.inline_policy_count > 0
-        AND p.scan_start_ms >= $scan_start
-      RETURN p.principal_type AS type,
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND (p.attached_policy_count > 0 OR p.inline_policy_count > 0)
+      RETURN labels(p) AS cloud,
+             p.principal_type AS type,
              count(p) AS count_with_policies,
              sum(CASE WHEN p.tags = '{}' OR p.tags IS NULL THEN 1 ELSE 0 END) AS untagged,
              'Access control inventory — verify policies align with documented business requirements' AS action
-      ORDER BY count_with_policies DESC
+      ORDER BY cloud, type
     recommendation: >
-      Document the business requirement for each IAM policy grant. Maintain
-      an access matrix mapping roles to required permissions. Review annually.
+      Document the business requirement for each IAM policy grant across all clouds.
+      Maintain an access matrix mapping roles to required permissions. Review annually.
     mitre: []
     references: ["https://www.iso.org/standard/27001"]
 
@@ -35,118 +35,128 @@ checks:
     title: "A.5.16: Identity Management — unique identifiers for all users"
     severity: HIGH
     description: >
-      ISO 27001 A.5.16: The full life cycle of identities shall be managed.
-      All users must have unique identifiers. Generic or shared accounts violate this control.
+      ISO 27001 A.5.16: The full lifecycle of identities shall be managed.
+      All users must have unique identifiers. Generic accounts violate this control.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE toLower(p.name) IN ['admin', 'administrator', 'test', 'guest',
-        AND p.scan_start_ms >= $scan_start
-                                  'user', 'shared', 'common', 'service', 'root']
-      RETURN p.arn AS user_arn,
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type = 'User'
+        AND toLower(COALESCE(p.name,'')) IN [
+          'admin', 'administrator', 'test', 'guest',
+          'user', 'shared', 'common', 'service', 'root', 'default'
+        ]
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
              p.name AS username,
              'ISO A.5.16: Generic account name violates unique identity requirement' AS issue
+      ORDER BY cloud, p.name
     recommendation: >
       Replace all generic/shared accounts with individually attributed accounts.
-      Naming: firstname.lastname@org or userid@org format.
+      Use firstname.lastname@org or userid@org format.
     mitre: ["T1078 - Valid Accounts"]
     references: ["https://www.iso.org/standard/27001"]
 
   - id: ISO-A.5.17
-    title: "A.5.17: Authentication Information — secure credential management"
+    title: "A.5.17: Authentication Information — MFA across all clouds"
     severity: HIGH
     description: >
       ISO 27001 A.5.17: The allocation and management of authentication information
-      shall be controlled by a management process, including advising personnel on
-      appropriate handling of authentication information.
+      shall be controlled. All cloud user accounts must use MFA.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE NOT p.name = 'root'
-        AND p.scan_start_ms >= $scan_start
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type = 'User'
+        AND NOT p.name = 'root'
         AND NOT p.metadata CONTAINS '"mfa_active": true'
-      RETURN p.arn AS user_arn,
-             p.name AS username,
+        AND NOT p.metadata CONTAINS '"mfa_enabled": true'
+        AND NOT p.metadata CONTAINS '"strong_auth": true'
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
+             p.name AS name,
              'ISO A.5.17: No MFA — authentication information not adequately protected' AS issue
-      ORDER BY p.name
+      ORDER BY cloud, p.name
     recommendation: >
-      Enforce MFA organisation-wide. Update Information Security Policy to require
-      MFA for all cloud access. Document in your ISO 27001 Statement of Applicability.
-    mitre: ["T1078.004 - Cloud Accounts"]
+      Enforce MFA organisation-wide across all cloud platforms.
+      Update Information Security Policy to require MFA for all cloud access.
+    mitre: ["T1078 - Valid Accounts"]
     references: ["https://www.iso.org/standard/27001"]
 
   - id: ISO-A.5.18
-    title: "A.5.18: Access Rights — review and remove access promptly"
+    title: "A.5.18: Access Rights — remove or revoke access promptly"
     severity: MEDIUM
     description: >
-      ISO 27001 A.5.18: Access rights to information and associated assets shall
-      be provisioned, reviewed, modified, and removed in a timely manner.
-      Zero-policy identities indicate orphaned accounts.
+      ISO 27001 A.5.18: Access rights shall be provisioned, reviewed, modified,
+      and removed in a timely manner. Zero-policy identities indicate orphaned accounts.
     cypher: |
-      MATCH (p:AWSPrincipal)
-      WHERE (p.attached_policy_count = 0 OR p.attached_policy_count IS NULL)
-        AND p.scan_start_ms >= $scan_start
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND (p.attached_policy_count = 0 OR p.attached_policy_count IS NULL)
         AND (p.inline_policy_count = 0 OR p.inline_policy_count IS NULL)
-        AND p.principal_type IN ['User', 'Role']
-      RETURN p.principal_type AS type,
-             p.arn AS principal,
+        AND p.principal_type IN ['User', 'Role', 'ServiceAccount', 'ServicePrincipal']
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
              p.name AS name,
+             p.principal_type AS type,
              'ISO A.5.18: No access rights assigned — potential orphaned account to remove' AS issue
-      ORDER BY p.principal_type, p.name
+      ORDER BY cloud, type, name
       LIMIT 100
     recommendation: >
-      Implement joiner-mover-leaver process. Remove access within 24 hours of
-      role change or departure. Document in HR-IT integration procedures.
+      Implement joiner-mover-leaver process across all clouds. Remove access within
+      24 hours of role change or departure. Document in HR-IT integration procedures.
     mitre: ["T1078 - Valid Accounts"]
     references: ["https://www.iso.org/standard/27001"]
 
   - id: ISO-A.5.19
-    title: "A.5.19: Information Security in Supplier Relationships — third-party access"
+    title: "A.5.19: Supplier Relationships — third-party identity access"
     severity: HIGH
     description: >
-      ISO 27001 A.5.19: Processes and procedures shall be defined to manage
-      information security risks associated with the use of supplier products and
-      services. Supplier IAM roles need extra scrutiny.
+      ISO 27001 A.5.19: Information security in supplier relationships shall be
+      governed. Service principals and roles for vendors need extra scrutiny.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'Role'})
-      WHERE p.metadata CONTAINS '"Federated"'
-        AND p.scan_start_ms >= $scan_start
-         OR toLower(p.name) CONTAINS 'vendor'
-         OR toLower(p.name) CONTAINS 'partner'
-         OR toLower(p.name) CONTAINS 'third'
-         OR toLower(p.name) CONTAINS 'external'
-      RETURN p.arn AS role_arn,
-             p.name AS role_name,
-             p.attached_policy_count AS policies,
-             'ISO A.5.19: Apparent supplier/third-party role — verify access is scoped and monitored' AS issue
-      ORDER BY p.name
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type IN ['Role', 'ServicePrincipal', 'ServiceAccount']
+        AND (p.metadata CONTAINS '"Federated"'
+          OR toLower(COALESCE(p.name,'')) CONTAINS 'vendor'
+          OR toLower(COALESCE(p.name,'')) CONTAINS 'partner'
+          OR toLower(COALESCE(p.name,'')) CONTAINS 'third'
+          OR toLower(COALESCE(p.name,'')) CONTAINS 'external')
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
+             p.name AS name,
+             COALESCE(p.attached_policy_count, 0) AS policies,
+             'ISO A.5.19: Apparent supplier identity — verify scoped access and active monitoring' AS issue
+      ORDER BY cloud, p.name
     recommendation: >
-      Review all third-party IAM roles. Add ExternalId conditions. Scope to
-      minimum required permissions. Require MFA or strong authentication.
-      Include in annual supplier security review.
+      Review all third-party identities. Add ExternalId or Condition blocks.
+      Scope to minimum required permissions. Include in annual supplier security review.
     mitre: ["T1199 - Trusted Relationship"]
     references: ["https://www.iso.org/standard/27001"]
 
   - id: ISO-A.8.2
-    title: "A.8.2: Privileged Access Rights — strictly controlled"
+    title: "A.8.2: Privileged Access Rights — strictly controlled across all clouds"
     severity: CRITICAL
     description: >
       ISO 27001 A.8.2: The allocation and use of privileged access rights shall
-      be restricted and managed. All admin-level access must be documented,
-      justified, and subject to enhanced monitoring.
+      be restricted and managed. All admin-level access must be documented and
+      subject to enhanced monitoring.
     cypher: |
-      MATCH (p:AWSPrincipal)
-      WHERE p.attached_policies CONTAINS 'AdministratorAccess'
-        AND p.scan_start_ms >= $scan_start
-         OR p.attached_policies CONTAINS 'IAMFullAccess'
-         OR p.inline_policies CONTAINS '"Action": "*"'
-      RETURN p.arn AS principal_arn,
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND (p.attached_policies CONTAINS 'AdministratorAccess'
+          OR p.attached_policies CONTAINS 'IAMFullAccess'
+          OR p.attached_policies CONTAINS 'Owner'
+          OR p.attached_policies CONTAINS 'roles/owner'
+          OR p.inline_policies CONTAINS '"Action": "*"')
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
              p.name AS name,
              p.principal_type AS type,
-             'ISO A.8.2: Privileged access — verify documented justification and enhanced monitoring' AS issue
-      ORDER BY p.principal_type, p.name
+             'ISO A.8.2: Privileged access — requires documented justification and enhanced monitoring' AS issue
+      ORDER BY cloud, type, name
     recommendation: >
       Document each privileged access grant with: business justification, approver,
-      review date, and monitoring requirements. Include in Information Security
-      Risk Register. Review every 90 days minimum.
+      review date, and monitoring requirements. Review every 90 days minimum.
     mitre: ["T1078 - Valid Accounts", "T1548 - Abuse Elevation Control Mechanism"]
     references: ["https://www.iso.org/standard/27001"]
 
@@ -154,46 +164,51 @@ checks:
     title: "A.8.3: Information Access Restriction — need-to-know basis"
     severity: MEDIUM
     description: >
-      ISO 27001 A.8.3: Access to information and associated assets shall be
-      restricted in accordance with the access control policy (need-to-know).
+      ISO 27001 A.8.3: Access to information shall be restricted in accordance
+      with the access control policy. Users with policies but no tags cannot have
+      their access justified against a need-to-know basis.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE p.attached_policy_count > 0
-        AND p.scan_start_ms >= $scan_start
-         OR p.inline_policy_count > 0
-        AND (p.tags = '{}' OR p.tags IS NULL)
-      RETURN p.arn AS user_arn,
-             p.name AS username,
-             p.attached_policy_count + p.inline_policy_count AS total_policies,
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type = 'User'
+        AND (p.attached_policy_count > 0 OR p.inline_policy_count > 0)
+        AND (p.tags = '{}' OR p.tags IS NULL OR p.tags = '')
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
+             p.name AS name,
+             COALESCE(p.attached_policy_count,0) + COALESCE(p.inline_policy_count,0) AS total_policies,
              'ISO A.8.3: User has policies but no tags — cannot verify need-to-know basis' AS issue
       ORDER BY total_policies DESC
       LIMIT 100
     recommendation: >
-      Tag each IAM user with their job function and data classification access level.
+      Tag each identity with their job function and data classification access level.
       Document the business need for each policy grant in the access request system.
     mitre: []
     references: ["https://www.iso.org/standard/27001"]
 
   - id: ISO-A.8.5
-    title: "A.8.5: Secure Authentication — authentication requirements"
+    title: "A.8.5: Secure Authentication — MFA for all identities with permissions"
     severity: HIGH
     description: >
-      ISO 27001 A.8.5: Secure authentication technologies and procedures shall
-      be implemented based on information access restrictions and the access
-      control policy. MFA is required for cloud management access.
+      ISO 27001 A.8.5: Secure authentication technologies shall be implemented.
+      MFA is required for cloud management access on all platforms.
     cypher: |
-      MATCH (p:AWSPrincipal {principal_type: 'User'})
-      WHERE NOT p.name = 'root'
-        AND p.scan_start_ms >= $scan_start
-        AND NOT p.metadata CONTAINS '"mfa_active": true'
+      MATCH (p:Principal)
+      WHERE p.scan_start_ms >= $scan_start
+        AND p.principal_type = 'User'
+        AND NOT p.name = 'root'
         AND (p.attached_policy_count > 0 OR p.inline_policy_count > 0)
-      RETURN p.arn AS user_arn,
-             p.name AS username,
-             p.attached_policy_count AS policies,
+        AND NOT p.metadata CONTAINS '"mfa_active": true'
+        AND NOT p.metadata CONTAINS '"mfa_enabled": true'
+        AND NOT p.metadata CONTAINS '"strong_auth": true'
+      RETURN labels(p) AS cloud,
+             COALESCE(p.arn, p.object_id, p.email) AS principal_id,
+             p.name AS name,
+             COALESCE(p.attached_policy_count,0) AS policies,
              'ISO A.8.5: User with permissions but no MFA — fails secure authentication requirement' AS issue
-      ORDER BY p.attached_policy_count DESC
+      ORDER BY cloud, p.name
     recommendation: >
-      Mandate MFA for all users with IAM permissions. Update Security Policy
-      to require MFA as a secure authentication control for cloud systems.
-    mitre: ["T1078.004 - Cloud Accounts"]
+      Mandate MFA for all users with cloud permissions across all platforms.
+      Update Security Policy to require MFA as a baseline authentication control.
+    mitre: ["T1078 - Valid Accounts"]
     references: ["https://www.iso.org/standard/27001"]

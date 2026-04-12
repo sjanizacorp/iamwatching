@@ -561,38 +561,52 @@ class PatternMatcher:
         check_ids: Optional[list] = None,
         use_registry: bool = True,
         scan_start_ms: int = 0,
+        active_clouds: Optional[set] = None,
     ) -> list[Finding]:
         """
         Run all checks. By default merges built-in RULES tuples with
         checks loaded from the YAML registry (CIS, OWASP, NIST, custom).
 
+        active_clouds: Set of cloud names being scanned: {"aws"}, {"azure"}, {"gcp"},
+            or any combination. Passed explicitly from the CLI — never derived from
+            framework names — so compliance frameworks (NIST/OWASP/PCI/ISO) appearing
+            in the always-run list do NOT incorrectly activate AWS rule execution.
+
         scan_start_ms: Neo4j-epoch millisecond timestamp recorded before the
-        scan import. Cross-cloud checks use this to filter results to only
-        nodes updated in the current scan, preventing stale data from a
-        previous cloud scan from appearing in findings.
+            scan import. All checks use this to filter results to only nodes
+            written in the current scan.
         """
         findings = []
 
-        # Map rule ID prefix to the cloud flag that must be active for it to run.
-        # AWS-* rules only run during --aws scans; AZ-* during --azure; GCP-* during --gcp.
+        # Map rule ID prefix to the cloud that must be active for it to run.
+        # AWS-* rules only run during --aws; AZ-* during --azure; GCP-* during --gcp.
         _rule_cloud_map = {
             "AWS": "aws",
             "AZ":  "azure",
             "GCP": "gcp",
         }
-        # Derive active clouds from the frameworks filter (None = all clouds active)
-        _active_clouds: set[str] = set()
-        if frameworks is None:
+
+        # Use explicitly passed active_clouds. Fall back to deriving from
+        # AWS-SPECIFIC framework prefixes ONLY — never from NIST/OWASP/PCI/ISO
+        # since those are always-run compliance frameworks, not cloud selectors.
+        if active_clouds is not None:
+            _active_clouds = set(active_clouds)
+        elif frameworks is None:
             _active_clouds = {"aws", "azure", "gcp"}
         else:
             fw_joined = " ".join(f.upper() for f in frameworks)
-            if any(x in fw_joined for x in ("CIS-AWS", "AWS-COMPUTE", "AWS-DATA",
-                                              "NIST", "OWASP", "PCI", "ISO")):
+            _active_clouds: set[str] = set()
+            # Only AWS-SPECIFIC prefixes count — not NIST/OWASP/PCI/ISO
+            if any(x in fw_joined for x in ("CIS-AWS", "AWS-COMPUTE", "AWS-DATA")):
                 _active_clouds.add("aws")
             if "AZURE" in fw_joined:
                 _active_clouds.add("azure")
             if "GCP" in fw_joined:
                 _active_clouds.add("gcp")
+            # If nothing matched (e.g. only CROSS-CLOUD/CUSTOM/NIST/OWASP), run all clouds
+            # so compliance checks surface findings regardless of cloud flag
+            if not _active_clouds:
+                _active_clouds = {"aws", "azure", "gcp"}
 
         # ── Built-in hardcoded rules ─────────────────────────────────
         for rule in RULES:
